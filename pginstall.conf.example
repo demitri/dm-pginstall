@@ -1,0 +1,14 @@
+# pginstall.conf - Version pinning configuration
+#
+# Copy this file to pginstall.conf and uncomment/modify versions as needed.
+# Any version not specified here will be auto-detected from upstream sources.
+#
+# Usage: ./pginstall.py --config pginstall.conf
+
+[versions]
+# postgresql = 17.2
+# icu = 76.1
+# readline = 8.2
+# q3c = 2.0.1
+# ast = 9.3.0
+# pgast = main
