@@ -143,31 +143,44 @@ pgvector is installed separately since it may be added to an existing PostgreSQL
 
 ### create_pg_service.py (Linux only)
 
-Creates a systemd service to run PostgreSQL as a system service. This script:
+Creates systemd services to run PostgreSQL instances. Uses template units to support multiple instances running simultaneously. This script:
 - Creates a `postgres` system user if it doesn't exist
-- Initializes the database cluster
-- Creates and enables a systemd service
-- Starts PostgreSQL
+- Initializes the database cluster for each instance
+- Creates a systemd template unit (`postgresql@.service`)
+- Creates per-instance configuration in `/etc/postgresql/<instance>/`
+- Enables and starts the instance
 
 ```bash
-# Interactive mode (prompts for settings)
-sudo ./create_pg_service.py
+# Create a "main" instance (prompts for settings)
+sudo ./create_pg_service.py main
+
+# Create a "dev" instance on a different port
+sudo ./create_pg_service.py dev --port 5433
 
 # Specify all options
-sudo ./create_pg_service.py --pgdata /usr/local/postgresql/data \
-                            --logfile /var/log/postgresql/postgresql.log \
-                            --port 5432
+sudo ./create_pg_service.py test --pgdata /data/test \
+                                 --logfile /var/log/postgresql/test.log \
+                                 --port 5434
 
-# Use a custom service name (for multiple instances)
-sudo ./create_pg_service.py --service-name postgresql-dev --port 5433
+# List all configured instances
+./create_pg_service.py --list
 ```
 
 Options:
-- `--pgdata` - Data directory (default: `/usr/local/postgresql/data`)
-- `--logfile` - Log file location (default: `/var/log/postgresql/postgresql.log`)
+- `instance` - Instance name (required, e.g., 'main', 'dev', 'test')
+- `--pgdata` - Data directory (default: `/usr/local/postgresql/data/<instance>`)
+- `--logfile` - Log file location (default: `/var/log/postgresql/<instance>.log`)
 - `--port` - Port number (default: `5432`)
-- `--user` - User to run as (default: `postgres`, created if needed)
-- `--service-name` - Systemd service name (default: `postgresql`)
+- `--list` - List all configured instances (no sudo required)
+
+Managing instances:
+```bash
+sudo systemctl start postgresql@main     # Start instance
+sudo systemctl stop postgresql@main      # Stop instance
+sudo systemctl restart postgresql@main   # Restart instance
+sudo systemctl status postgresql@main    # Check status
+journalctl -u postgresql@main            # View logs
+```
 
 ## Configuration File
 
@@ -231,10 +244,10 @@ Add this to your `~/.bashrc` or `~/.zshrc` for persistence.
 Use the included script to set up PostgreSQL as a system service:
 
 ```bash
-sudo ./create_pg_service.py
+sudo ./create_pg_service.py main
 ```
 
-This creates a `postgres` user, initializes the database, and starts PostgreSQL as a systemd service that starts automatically on boot.
+This creates a `postgres` user, initializes the database, and starts a PostgreSQL instance named "main" as a systemd service that starts automatically on boot. You can create additional instances (e.g., `dev`, `test`) on different ports.
 
 #### Option 2: Manual Setup
 
