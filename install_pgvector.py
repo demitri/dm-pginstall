@@ -19,6 +19,7 @@ Options:
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 # Constants
 SRC_DIR = Path("/usr/local/src")
@@ -33,14 +35,54 @@ GITHUB_API = "https://api.github.com"
 DEFAULT_PG_CONFIG = Path("/usr/local/postgresql/bin/pg_config")
 
 
+def get_platform() -> str:
+    """Return 'linux' or 'darwin'."""
+    return platform.system().lower()
+
+
+def find_macos_sdk() -> Optional[str]:
+    """Find the current macOS SDK path. Returns None on Linux or if not found."""
+    if get_platform() != "darwin":
+        return None
+
+    try:
+        result = subprocess.run(
+            ["xcrun", "--show-sdk-path"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def get_sanitized_env() -> dict:
-    """Return environment dict with anaconda removed from PATH."""
+    """Return environment dict with problematic paths removed and macOS SDK set."""
     env = os.environ.copy()
     path_parts = env.get("PATH", "").split(":")
+    # Remove paths that contain non-Apple gcc which is incompatible with
+    # clang-specific compiler flags used by PostgreSQL on macOS
     sanitized_path = ":".join(
-        p for p in path_parts if "/usr/local/anaconda" not in p and "/anaconda" not in p
+        p for p in path_parts
+        if "/usr/local/anaconda" not in p
+        and "/anaconda" not in p
+        and "/opt/homebrew/Cellar/gcc" not in p
+        and "/usr/local/Cellar/gcc" not in p
+        and "/usr/local/gfortran" not in p  # gfortran bundle includes incompatible gcc
     )
     env["PATH"] = sanitized_path
+
+    # On macOS, set SDKROOT to the current SDK path
+    # This fixes issues when Xcode has been updated since PostgreSQL was built
+    if get_platform() == "darwin":
+        sdk_path = find_macos_sdk()
+        if sdk_path:
+            env["SDKROOT"] = sdk_path
+        # Ensure we use Apple's clang, not any other gcc
+        # pgvector's Makefile uses $(CC) which defaults to the CC env var
+        env["CC"] = "/usr/bin/clang"
+
     return env
 
 
