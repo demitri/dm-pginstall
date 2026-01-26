@@ -81,6 +81,14 @@ sudo dnf install llvm-devel clang
 xcode-select --install
 ```
 
+`pkg-config` is also required. Install from source (https://pkg-config.freedesktop.org/releases/) or via Homebrew (`brew install pkg-config`).
+
+For building the Starlink AST library, `gfortran` is required. Download and install the appropriate version for your macOS from:
+
+https://github.com/fxcoudert/gfortran-for-macOS/releases
+
+> **Note**: If using `--exclude-ast`, gfortran can be omitted.
+
 ## Usage
 
 ### pginstall.py
@@ -227,6 +235,27 @@ Components are built in dependency order:
    └── pgast (requires AST)
 ```
 
+## Upgrading PostgreSQL
+
+When installing a new PostgreSQL version, the script:
+
+1. **Detects existing installations** in `/usr/local/postgresql-*`
+2. **Shows what the current symlink points to** (e.g., `/usr/local/postgresql` → `postgresql-17.5`)
+3. **Prompts whether to update the symlink** to the new version
+4. **Never deletes existing installations** - you must remove old versions manually if desired
+
+This allows you to have multiple PostgreSQL versions installed side-by-side and switch between them by updating the symlink.
+
+To manually switch versions:
+```bash
+sudo ln -sfn /usr/local/postgresql-17.5 /usr/local/postgresql
+```
+
+To remove an old installation:
+```bash
+sudo rm -rf /usr/local/postgresql-17.5
+```
+
 ## Post-Installation
 
 ### Add PostgreSQL to PATH
@@ -336,8 +365,9 @@ eval "$(./install_pgvector.py --completions zsh)"
 
 - Readline is built from source (GNU version, not Apple's libedit)
 - Uses `--with-bonjour` for PostgreSQL
-- LLVM/JIT: Auto-detected in `/usr/local/opt/llvm/bin/llvm-config` (Homebrew)
-- No Homebrew dependencies required
+- LLVM/JIT: Auto-detected in `/opt/homebrew/opt/llvm/bin/llvm-config` (Apple Silicon) or `/usr/local/opt/llvm/bin/llvm-config` (Intel)
+- Automatically sets `SDKROOT` for gfortran compatibility across macOS versions
+- No Homebrew dependencies required (but Homebrew paths are supported)
 
 ### Both Platforms
 
@@ -393,6 +423,20 @@ sudo dnf install patchelf  # Fedora/RHEL
 ```
 
 The anaconda version of patchelf won't work with sudo.
+
+### Stale SDK Path After Xcode Update (macOS)
+
+After updating Xcode, you may see errors like:
+```
+clang: warning: no such sysroot directory: '/Applications/Xcode.app/.../MacOSX15.4.sdk'
+ld: library 'z' not found
+```
+
+This happens because PostgreSQL records the SDK path at compile time. The installer automatically detects and fixes stale SDK paths when building extensions. If you encounter this error with an existing PostgreSQL installation, you may need to rebuild PostgreSQL or manually set `SDKROOT`:
+
+```bash
+export SDKROOT=$(xcrun --show-sdk-path)
+```
 
 ## Version Detection
 
