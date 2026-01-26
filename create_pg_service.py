@@ -366,11 +366,14 @@ Examples:
         list_instances()
         return
 
-    # Instance name is required for creating a service
-    if not args.instance:
-        parser.error("Instance name is required (e.g., 'main', 'dev')")
-
-    instance = args.instance
+    # Prompt for instance name if not provided
+    if args.instance:
+        instance = args.instance
+    else:
+        print("Instance name identifies this PostgreSQL server (e.g., 'main', 'dev', 'test').")
+        print("You can run multiple instances simultaneously on different ports.")
+        print()
+        instance = prompt_for_value("Instance name")
 
     # Checks
     check_linux()
