@@ -190,6 +190,69 @@ sudo systemctl status postgresql@main    # Check status
 journalctl -u postgresql@main            # View logs
 ```
 
+### create_pg_service_macos.py (macOS only)
+
+Creates launchd services to run PostgreSQL instances on macOS. Similar to the Linux version but uses launchd instead of systemd. This script:
+- Creates a `postgres` system user if it doesn't exist (or uses your specified user)
+- Optionally adds your user to the `postgres` group for file access
+- Initializes the database cluster for each instance
+- Configures memory settings based on your system resources
+- Creates a launchd plist in `/Library/LaunchDaemons/`
+- Creates per-instance configuration in `/usr/local/etc/postgresql/<instance>/`
+- Loads and starts the instance
+
+```bash
+# Create a "main" instance (prompts for settings)
+sudo ./create_pg_service_macos.py main
+
+# Create a "dev" instance on a different port
+sudo ./create_pg_service_macos.py dev --port 5433
+
+# Run as your own user (convenient for development)
+sudo ./create_pg_service_macos.py dev --user $(whoami) --port 5433
+
+# Specify all options including memory profile
+sudo ./create_pg_service_macos.py test --pgdata /data/test \
+                                       --logfile /usr/local/var/log/postgresql/test.log \
+                                       --port 5434 \
+                                       --user postgres \
+                                       --memory medium
+
+# List all configured instances
+./create_pg_service_macos.py --list
+```
+
+Options:
+- `instance` - Instance name (required, e.g., 'main', 'dev', 'test')
+- `--pgdata` - Data directory (default: `/usr/local/postgresql/data/<instance>`)
+- `--logfile` - Log file location (default: `/usr/local/var/log/postgresql/<instance>.log`)
+- `--port` - Port number (default: `5432`)
+- `--user` - User to run PostgreSQL as (default: `postgres`)
+- `--memory` - Memory profile: `lite`, `medium`, `max`, or `skip` (default: prompt)
+- `--list` - List all configured instances (no sudo required)
+
+Memory profiles (percentage of system RAM for shared_buffers):
+- `lite` - 10% of RAM, good for development or shared systems
+- `medium` - 25% of RAM, balanced for dedicated development machines
+- `max` - 40% of RAM, for dedicated database servers
+- `skip` - Use PostgreSQL defaults (can configure later)
+
+Managing instances:
+```bash
+sudo launchctl kickstart system/com.postgresql.main       # Start instance
+sudo launchctl kill SIGTERM system/com.postgresql.main    # Stop instance
+sudo launchctl kickstart -k system/com.postgresql.main    # Restart instance
+sudo launchctl print system/com.postgresql.main           # Check status
+tail -f /usr/local/var/log/postgresql/main.log            # View logs
+```
+
+To permanently remove an instance:
+```bash
+sudo launchctl bootout system/com.postgresql.main
+sudo rm /Library/LaunchDaemons/com.postgresql.main.plist
+sudo rm -r /usr/local/etc/postgresql/main
+```
+
 ## Configuration File
 
 Pin specific versions instead of auto-detecting latest:
@@ -459,6 +522,7 @@ The installer auto-detects latest versions from:
 | `pginstall.py` | Main installer script |
 | `install_pgvector.py` | Separate pgvector installer |
 | `create_pg_service.py` | Systemd service setup (Linux only) |
+| `create_pg_service_macos.py` | Launchd service setup (macOS only) |
 | `add_rpaths_to_dylibs.py` | Rpath fixer for shared libraries |
 | `test_install.sh` | Post-installation verification script |
 | `pginstall.conf.example` | Example configuration file |
