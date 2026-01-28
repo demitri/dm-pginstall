@@ -141,6 +141,53 @@ pgvector is installed separately since it may be added to an existing PostgreSQL
 ./install_pgvector.py --pg-config /opt/postgresql/bin/pg_config
 ```
 
+### pgstatus.py
+
+Discovers and manages PostgreSQL instances on Linux and macOS. Supports systemd services, Homebrew services, and pg_ctl-managed instances.
+
+```bash
+# List all instances (default command)
+./pgstatus.py
+
+# List with expanded details and commands
+./pgstatus.py list --expand
+
+# List as JSON
+./pgstatus.py list --json
+
+# Show detailed info for an instance
+./pgstatus.py info main
+
+# Start/stop/restart an instance
+./pgstatus.py start main
+./pgstatus.py stop main
+./pgstatus.py restart main
+
+# Preview commands without executing
+./pgstatus.py stop main --dry-run
+```
+
+Commands:
+- `list` - List all PostgreSQL instances (default)
+- `info <instance>` - Show detailed info about an instance
+- `start <instance>` - Start an instance
+- `stop <instance>` - Stop an instance
+- `restart <instance>` - Restart an instance
+
+Options:
+- `--json` - Output as JSON (for list, info)
+- `--expand`, `-e` - Show expanded details including commands (for list)
+- `--dry-run` - Show what would be done (for start/stop/restart)
+- `--completions` - Output shell completion script
+
+Example output:
+```
+Instance  Status   Port   Version  Data Directory
+--------  ------   ----   -------  --------------
+main      running  5432   17.2     /usr/local/postgresql/data/main
+dev       stopped  5433   17.2     /usr/local/postgresql/data/dev
+```
+
 ### create_pg_service.py (Linux only)
 
 Creates systemd services to run PostgreSQL instances. Uses template units to support multiple instances running simultaneously. This script:
@@ -314,6 +361,7 @@ Both scripts support tab completion for bash and zsh.
 # Add to ~/.bashrc
 eval "$(./pginstall.py --completions bash)"
 eval "$(./install_pgvector.py --completions bash)"
+eval "$(./pgstatus.py --completions)"
 ```
 
 ### Zsh
@@ -322,6 +370,7 @@ eval "$(./install_pgvector.py --completions bash)"
 # Add to ~/.zshrc
 eval "$(./pginstall.py --completions zsh)"
 eval "$(./install_pgvector.py --completions zsh)"
+eval "$(./pgstatus.py --completions)"
 ```
 
 ## Platform-Specific Notes
@@ -415,6 +464,7 @@ The installer auto-detects latest versions from:
 | `pginstall.py` | Main installer script |
 | `install_pgvector.py` | Separate pgvector installer |
 | `create_pg_service.py` | Systemd service setup (Linux only) |
+| `pgstatus.py` | Instance manager (list, info, start/stop/restart) |
 | `add_rpaths_to_dylibs.py` | Rpath fixer for shared libraries |
 | `test_install.sh` | Post-installation verification script |
 | `pginstall.conf.example` | Example configuration file |
