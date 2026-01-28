@@ -69,14 +69,19 @@ PGLOG={logfile}
 def check_root():
     """Check if running as root (required for systemd operations)."""
     if os.geteuid() != 0:
-        print("Error: This script must be run as root (use sudo).", file=sys.stderr)
+        print("Root privileges required. Run with sudo:")
+        print(f"  sudo {' '.join(sys.argv)}")
         sys.exit(1)
 
 
 def check_linux():
     """Check if running on Linux."""
     if sys.platform != "linux":
-        print("Error: This script is Linux-specific (requires systemd).", file=sys.stderr)
+        if sys.platform == "darwin":
+            print("This script creates systemd services for Linux.")
+            print("For macOS, use create_pg_service_macos.py instead.")
+        else:
+            print("This script is Linux-specific (requires systemd).", file=sys.stderr)
         sys.exit(1)
 
 
@@ -366,6 +371,15 @@ Examples:
         list_instances()
         return
 
+    # All checks first (before any output)
+    check_linux()
+    check_root()
+    check_postgresql_installed()
+
+    # One-liner description
+    print("Creates a PostgreSQL systemd service for automatic startup on boot.")
+    print()
+
     # Prompt for instance name if not provided
     if args.instance:
         instance = args.instance
@@ -374,11 +388,6 @@ Examples:
         print("You can run multiple instances simultaneously on different ports.")
         print()
         instance = prompt_for_value("Instance name")
-
-    # Checks
-    check_linux()
-    check_root()
-    check_postgresql_installed()
 
     # Check if instance already exists
     instance_config = PG_CONFIG_BASE / instance / "postgresql.conf"

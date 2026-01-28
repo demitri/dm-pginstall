@@ -39,6 +39,9 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 # GitHub API base
 GITHUB_API = "https://api.github.com"
 
+# gfortran releases page for macOS
+GFORTRAN_MACOS_RELEASES = "https://github.com/fxcoudert/gfortran-for-macOS/releases"
+
 # Contrib extensions to build
 CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "pg_trgm"]
 
@@ -61,14 +64,150 @@ def get_cpu_count() -> int:
 
 
 def get_sanitized_env() -> dict:
-    """Return environment dict with /usr/local/anaconda/bin removed from PATH."""
+    """Return environment dict with PATH cleaned up for builds.
+
+    - Removes anaconda paths (can cause conflicts)
+    - Adds /usr/local/pkg-config/bin if it exists (macOS source install)
+    """
     env = os.environ.copy()
     path_parts = env.get("PATH", "").split(":")
-    sanitized_path = ":".join(
+
+    # Remove anaconda paths
+    sanitized_parts = [
         p for p in path_parts if "/usr/local/anaconda" not in p and "/anaconda" not in p
-    )
-    env["PATH"] = sanitized_path
+    ]
+
+    # Add pkg-config path if it exists and not already in PATH
+    pkg_config_bin = "/usr/local/pkg-config/bin"
+    if Path(pkg_config_bin).is_dir() and pkg_config_bin not in sanitized_parts:
+        sanitized_parts.insert(0, pkg_config_bin)
+
+    env["PATH"] = ":".join(sanitized_parts)
     return env
+
+
+def find_macos_sdk() -> Optional[str]:
+    """Find the current macOS SDK path. Returns None on Linux or if not found."""
+    if get_platform() != "darwin":
+        return None
+
+    try:
+        result = subprocess.run(
+            ["xcrun", "--show-sdk-path"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def get_extension_build_env() -> dict:
+    """Get environment for building PostgreSQL extensions."""
+    env = get_sanitized_env()
+
+    if get_platform() == "darwin":
+        sdk_path = find_macos_sdk()
+        if sdk_path:
+            env["SDKROOT"] = sdk_path
+
+    return env
+
+
+def fix_stale_isysroot(flags: str, sdk_path: str) -> str:
+    """Replace stale -isysroot in a flags string with the current SDK path.
+
+    Args:
+        flags: A compiler/linker flags string (e.g., from pg_config)
+        sdk_path: The current SDK path to use
+
+    Returns:
+        The flags string with -isysroot pointing to the current SDK.
+    """
+    if "-isysroot" not in flags:
+        return flags
+
+    # Remove any existing -isysroot and its argument
+    parts = flags.split()
+    filtered = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == "-isysroot":
+            skip_next = True
+            continue
+        if part.startswith("-isysroot"):
+            # Handle -isysroot/path (no space) - unlikely but handle it
+            continue
+        filtered.append(part)
+
+    # Add the correct -isysroot
+    filtered.append("-isysroot")
+    filtered.append(sdk_path)
+    return " ".join(filtered)
+
+
+def get_fixed_pg_config_flags(pg_config: Path, flag_type: str) -> Optional[str]:
+    """Get pg_config flags with stale -isysroot replaced by current SDK path.
+
+    On macOS, PostgreSQL embeds the SDK path used at compile time into pg_config.
+    After an Xcode update, this path may no longer exist. This function returns
+    corrected flags with the current SDK path.
+
+    Args:
+        pg_config: Path to pg_config binary
+        flag_type: One of "cppflags" or "ldflags"
+
+    Returns:
+        Fixed flags string, or None if no fix is needed (Linux or no -isysroot).
+    """
+    if get_platform() != "darwin":
+        return None
+
+    sdk_path = find_macos_sdk()
+    if not sdk_path:
+        return None
+
+    try:
+        result = subprocess.run(
+            [str(pg_config), f"--{flag_type}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        flags = result.stdout.strip()
+
+        if "-isysroot" not in flags:
+            return None
+
+        return fix_stale_isysroot(flags, sdk_path)
+
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_extension_make_args(pg_config: Path) -> list[str]:
+    """Get make arguments for building PostgreSQL extensions.
+
+    On macOS, includes fixed CPPFLAGS and LDFLAGS if the SDK path in pg_config
+    is stale (can happen after Xcode updates).
+    """
+    args = ["make", f"PG_CONFIG={pg_config}"]
+
+    # Fix CPPFLAGS (for compilation)
+    fixed_cppflags = get_fixed_pg_config_flags(pg_config, "cppflags")
+    if fixed_cppflags:
+        args.append(f"CPPFLAGS={fixed_cppflags}")
+
+    # Fix LDFLAGS (for linking)
+    fixed_ldflags = get_fixed_pg_config_flags(pg_config, "ldflags")
+    if fixed_ldflags:
+        args.append(f"LDFLAGS={fixed_ldflags}")
+
+    return args
 
 
 def find_llvm_config() -> Optional[str]:
@@ -76,7 +215,8 @@ def find_llvm_config() -> Optional[str]:
     # Common locations to check
     candidates = [
         "/usr/bin/llvm-config",
-        "/usr/local/opt/llvm/bin/llvm-config",  # macOS Homebrew
+        "/opt/homebrew/opt/llvm/bin/llvm-config",  # macOS Homebrew (Apple Silicon)
+        "/usr/local/opt/llvm/bin/llvm-config",  # macOS Homebrew (Intel)
     ]
 
     # Linux: check /usr/lib/llvm-*/bin/llvm-config
@@ -128,16 +268,73 @@ def check_existing(install_path: Path) -> bool:
     return install_path.is_dir()
 
 
+def find_existing_postgresql_installations() -> list[tuple[str, Path]]:
+    """Find existing PostgreSQL installations in INSTALL_BASE.
+
+    Returns:
+        List of (version, path) tuples for each found installation,
+        sorted by version (newest first).
+    """
+    installations = []
+    for path in INSTALL_BASE.glob("postgresql-*"):
+        if path.is_dir() and not path.is_symlink():
+            # Extract version from directory name
+            version = path.name.replace("postgresql-", "")
+            installations.append((version, path))
+
+    # Sort by version (newest first) using simple string comparison
+    # This works for PostgreSQL versions like "17.5", "18.1"
+    installations.sort(key=lambda x: [int(p) for p in x[0].split(".")], reverse=True)
+    return installations
+
+
+def get_symlink_target(symlink_path: Path) -> Optional[Path]:
+    """Get the target of a symlink, or None if it doesn't exist or isn't a symlink."""
+    if symlink_path.is_symlink():
+        target = symlink_path.resolve()
+        return target
+    return None
+
+
+def prompt_yes_no(question: str, default: bool = True) -> bool:
+    """Prompt user for yes/no answer.
+
+    Args:
+        question: The question to ask
+        default: Default answer if user just presses Enter
+
+    Returns:
+        True for yes, False for no
+    """
+    if default:
+        prompt = f"{question} [Y/n]: "
+    else:
+        prompt = f"{question} [y/N]: "
+
+    while True:
+        response = input(prompt).strip().lower()
+        if response == "":
+            return default
+        if response in ("y", "yes"):
+            return True
+        if response in ("n", "no"):
+            return False
+        print("Please answer 'y' or 'n'")
+
+
 def create_symlink(target: Path, link_name: Path, dry_run: bool = False) -> None:
     """Create or update versioned symlink using sudo."""
     if dry_run:
         print(f"  Would create symlink: {link_name} -> {target}")
         return
 
-    # Use sudo ln -sf to create/update symlink in /usr/local
+    # Use sudo ln -sfn to create/update symlink in /usr/local
+    # The -n flag is crucial: without it, if link_name is an existing symlink
+    # to a directory, ln would create the new link INSIDE that directory
+    # instead of replacing the symlink itself.
     try:
         subprocess.run(
-            ["sudo", "ln", "-sf", str(target), str(link_name)],
+            ["sudo", "ln", "-sfn", str(target), str(link_name)],
             check=True,
             capture_output=True,
             text=True,
@@ -643,9 +840,42 @@ def build_postgresql(
     print(f"Building PostgreSQL {version}")
     print(f"{'=' * 60}")
 
+    # Check for existing installations
+    existing_installations = find_existing_postgresql_installations()
+    current_symlink_target = get_symlink_target(symlink_path)
+    update_symlink = True  # Default to updating symlink
+
+    if existing_installations:
+        # Check if there are OTHER versions installed (not the one we're installing)
+        other_versions = [(v, p) for v, p in existing_installations if v != version]
+
+        if other_versions:
+            print(f"\n  Existing PostgreSQL installations found:")
+            for v, p in existing_installations:
+                marker = " (current symlink target)" if current_symlink_target == p else ""
+                print(f"    - {v}: {p}{marker}")
+
+            if current_symlink_target and current_symlink_target != install_path:
+                current_version = current_symlink_target.name.replace("postgresql-", "")
+                print(f"\n  The symlink '{symlink_path}' currently points to version {current_version}.")
+                print(f"  This script will NOT delete existing installations.")
+
+                if not dry_run:
+                    update_symlink = prompt_yes_no(
+                        f"\n  Update symlink to point to new version {version}?",
+                        default=True
+                    )
+                    if not update_symlink:
+                        print(f"  Will install {version} but leave symlink pointing to {current_version}")
+                else:
+                    print(f"  Would ask whether to update symlink to version {version}")
+
     if check_existing(install_path):
         print(f"  Already installed: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if update_symlink:
+            create_symlink(install_path, symlink_path, dry_run)
+        else:
+            print(f"  Symlink not updated (still points to {current_symlink_target})")
         return
 
     # Download and extract
@@ -733,8 +963,12 @@ def build_postgresql(
         print(f"  Would run: {' '.join(configure_cmd)}")
         print("  Would build and install PostgreSQL")
 
-    # Create symlink
-    create_symlink(install_path, symlink_path, dry_run)
+    # Create/update symlink based on user preference
+    if update_symlink:
+        create_symlink(install_path, symlink_path, dry_run)
+    else:
+        print(f"  Symlink not updated (still points to {current_symlink_target})")
+
     print(f"  PostgreSQL {version} installed successfully")
 
 
@@ -760,7 +994,7 @@ def build_contrib_extensions(
         print("  Contrib extensions must be built from PostgreSQL source", file=sys.stderr)
         return
 
-    env = get_sanitized_env()
+    env = get_extension_build_env()
 
     for ext in CONTRIB_EXTENSIONS:
         ext_path = src_path / ext
@@ -771,8 +1005,9 @@ def build_contrib_extensions(
         print(f"  Building {ext}...")
 
         # Build
+        make_args = get_extension_make_args(pg_config)
         run_build_cmd(
-            ["make", f"PG_CONFIG={pg_config}"],
+            make_args,
             cwd=ext_path,
             env=env,
             dry_run=dry_run,
@@ -780,8 +1015,10 @@ def build_contrib_extensions(
         )
 
         # Install
+        install_args = ["sudo"] + make_args[:]  # Copy the list
+        install_args.insert(2, "install")  # Insert after "make" and "PG_CONFIG=..."
         run_build_cmd(
-            ["sudo", "make", "install", f"PG_CONFIG={pg_config}"],
+            install_args,
             cwd=ext_path,
             env=env,
             dry_run=dry_run,
@@ -808,11 +1045,12 @@ def build_q3c(version: str, dry_run: bool = False, verbose: bool = False) -> Non
         print(f"  Would build q3c from: {src_path}")
         return
 
-    env = get_sanitized_env()
+    env = get_extension_build_env()
+    make_args = get_extension_make_args(pg_config)
 
     # Build
     run_build_cmd(
-        ["make", f"PG_CONFIG={pg_config}"],
+        make_args,
         cwd=src_path,
         env=env,
         dry_run=dry_run,
@@ -821,8 +1059,10 @@ def build_q3c(version: str, dry_run: bool = False, verbose: bool = False) -> Non
     )
 
     # Install
+    install_args = ["sudo"] + make_args[:]
+    install_args.insert(2, "install")
     run_build_cmd(
-        ["sudo", "make", "install", f"PG_CONFIG={pg_config}"],
+        install_args,
         cwd=src_path,
         env=env,
         dry_run=dry_run,
@@ -859,6 +1099,13 @@ def build_ast(version: str, dry_run: bool = False, verbose: bool = False) -> Non
         return
 
     env = get_sanitized_env()
+
+    # On macOS, set SDKROOT so gfortran can find system libraries
+    # This is needed when gfortran was built for an older macOS version
+    if get_platform() == "darwin":
+        sdk_path = find_macos_sdk()
+        if sdk_path:
+            env["SDKROOT"] = sdk_path
 
     # Configure
     configure_cmd = [
@@ -947,11 +1194,13 @@ def build_pgast(version: str, dry_run: bool = False, verbose: bool = False) -> N
         print(f"  Using AST library at: {ast_path}")
         return
 
-    env = get_sanitized_env()
+    env = get_extension_build_env()
+    make_args = get_extension_make_args(pg_config)
+    make_args.append(f"AST={ast_path}")
 
     # Build (pass AST path to make)
     run_build_cmd(
-        ["make", f"PG_CONFIG={pg_config}", f"AST={ast_path}"],
+        make_args,
         cwd=src_path,
         env=env,
         dry_run=dry_run,
@@ -960,8 +1209,10 @@ def build_pgast(version: str, dry_run: bool = False, verbose: bool = False) -> N
     )
 
     # Install (AST path also required for install target)
+    install_args = ["sudo"] + make_args[:]
+    install_args.insert(2, "install")
     run_build_cmd(
-        ["sudo", "make", "install", f"PG_CONFIG={pg_config}", f"AST={ast_path}"],
+        install_args,
         cwd=src_path,
         env=env,
         dry_run=dry_run,
@@ -1124,6 +1375,7 @@ def get_required_tools(exclude_ast: bool = False) -> list[str]:
 
     if plat == "darwin":
         tools.append("clang")
+        tools.append("pkg-config")
     else:
         tools.append("patchelf")
 
@@ -1148,6 +1400,26 @@ def find_system_patchelf() -> str | None:
     return None
 
 
+def find_pkg_config() -> Optional[str]:
+    """Find pkg-config binary. Returns path or None."""
+    # Check common source install location first
+    source_path = "/usr/local/pkg-config/bin/pkg-config"
+    if Path(source_path).is_file() and os.access(source_path, os.X_OK):
+        return source_path
+
+    # Check Homebrew paths
+    homebrew_paths = [
+        "/opt/homebrew/bin/pkg-config",  # Apple Silicon
+        "/usr/local/bin/pkg-config",  # Intel
+    ]
+    for path in homebrew_paths:
+        if Path(path).is_file() and os.access(path, os.X_OK):
+            return path
+
+    # Fall back to PATH
+    return shutil.which("pkg-config")
+
+
 def check_missing_tools(exclude_ast: bool = False) -> list[str]:
     """Return list of missing required tools."""
     required = get_required_tools(exclude_ast=exclude_ast)
@@ -1156,6 +1428,9 @@ def check_missing_tools(exclude_ast: bool = False) -> list[str]:
         if tool == "patchelf":
             # patchelf needs to be in system path for sudo to work
             if not find_system_patchelf():
+                missing.append(tool)
+        elif tool == "pkg-config":
+            if not find_pkg_config():
                 missing.append(tool)
         elif not shutil.which(tool):
             missing.append(tool)
@@ -1285,21 +1560,48 @@ def check_prerequisites(dry_run: bool = False, exclude_ast: bool = False) -> lis
     missing = missing_tools + missing_libs
 
     if missing:
+        plat = get_platform()
+        gfortran_missing_macos = plat == "darwin" and "gfortran" in missing_tools
+
         if dry_run:
             if missing_tools:
                 print(f"  🛑 Missing tools: {', '.join(missing_tools)}")
             if missing_libs:
                 print(f"  🛑 Missing libraries: {', '.join(missing_libs)}")
+            if gfortran_missing_macos:
+                print(f"\n  gfortran is required for building the Starlink AST library.")
+                print(f"  Download the installer for your macOS version from:")
+                print(f"    {GFORTRAN_MACOS_RELEASES}")
         else:
             if missing_tools:
                 print(f"Error: Missing required tools: {', '.join(missing_tools)}", file=sys.stderr)
             if missing_libs:
                 print(f"Error: Missing required libraries: {', '.join(missing_libs)}", file=sys.stderr)
+
+            # Special handling for macOS
+            if plat == "darwin":
+                # Check for pkg-config
+                if "pkg-config" in missing_tools:
+                    print(f"\n  pkg-config is required. Install from source:", file=sys.stderr)
+                    print(f"    https://pkg-config.freedesktop.org/releases/", file=sys.stderr)
+                    print(f"    (or via Homebrew: brew install pkg-config)", file=sys.stderr)
+
+                # Check for gfortran
+                if gfortran_missing_macos:
+                    print(f"\n  gfortran is required for building the Starlink AST library.", file=sys.stderr)
+                    print(f"  Download the installer for your macOS version from:", file=sys.stderr)
+                    print(f"    {GFORTRAN_MACOS_RELEASES}", file=sys.stderr)
+
+                # Check for other tools that come with Xcode
+                other_missing = [t for t in missing_tools if t not in ("pkg-config", "gfortran")]
+                if other_missing:
+                    print(f"\n  Install Xcode Command Line Tools: xcode-select --install", file=sys.stderr)
+
+                sys.exit(1)
+
             install_cmd = get_prereq_install_command(missing)
             if install_cmd:
                 print(f"  Install with: {install_cmd}", file=sys.stderr)
-            elif get_platform() == "darwin":
-                print("  Install Xcode Command Line Tools: xcode-select --install", file=sys.stderr)
             sys.exit(1)
     else:
         print("  ✅ All prerequisites satisfied")
