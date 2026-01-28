@@ -346,47 +346,62 @@ def discover_homebrew_instances() -> list[PostgreSQLInstance]:
 
 
 def discover_launchd_instances() -> list[PostgreSQLInstance]:
-    """Discover PostgreSQL instances from LaunchAgents on macOS."""
+    """Discover PostgreSQL instances from launchd on macOS."""
     instances = []
 
     if get_platform() != "darwin":
         return instances
 
-    # Check user LaunchAgents
-    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
-    if not launch_agents_dir.exists():
-        return instances
+    # Check both user LaunchAgents and system LaunchDaemons
+    # create_pg_service_macos.py creates plists in /Library/LaunchDaemons/
+    launchd_dirs = [
+        Path.home() / "Library" / "LaunchAgents",
+        Path("/Library/LaunchDaemons"),
+    ]
 
-    for plist in launch_agents_dir.glob("*postgres*.plist"):
-        try:
-            instance_name = plist.stem.replace("homebrew.mxcl.", "").replace(".", "-")
-
-            instance = PostgreSQLInstance(
-                name=instance_name,
-                service_type=ServiceType.LAUNCHD,
-                service_name=plist.stem,
-                env_file=plist,
-            )
-
-            # Parse plist for data directory (simplified - would need plistlib for full parsing)
-            plist_content = plist.read_text()
-            match = re.search(r"-D[</string>\s]*<string>([^<]+)", plist_content)
-            if match:
-                instance.data_directory = Path(match.group(1))
-
-            if instance.data_directory:
-                instance.version = read_pg_version(instance.data_directory)
-                instance.config_file = instance.data_directory / "postgresql.conf"
-                instance.port = read_port_from_config(instance.config_file)
-
-            # Check if running via launchctl
-            instance.status = get_launchd_status(plist.stem)
-            instance.pg_ctl_path = find_pg_ctl()
-
-            instances.append(instance)
-
-        except (OSError, IOError):
+    for launchd_dir in launchd_dirs:
+        if not launchd_dir.exists():
             continue
+
+        for plist in launchd_dir.glob("*postgres*.plist"):
+            try:
+                # Extract instance name from plist filename
+                # com.postgresql.main.plist -> main
+                # homebrew.mxcl.postgresql.plist -> postgresql
+                stem = plist.stem
+                if stem.startswith("com.postgresql."):
+                    instance_name = stem.replace("com.postgresql.", "")
+                elif stem.startswith("homebrew.mxcl."):
+                    instance_name = stem.replace("homebrew.mxcl.", "")
+                else:
+                    instance_name = stem.replace(".", "-")
+
+                instance = PostgreSQLInstance(
+                    name=instance_name,
+                    service_type=ServiceType.LAUNCHD,
+                    service_name=stem,
+                    env_file=plist,
+                )
+
+                # Parse plist for data directory (simplified - would need plistlib for full parsing)
+                plist_content = plist.read_text()
+                match = re.search(r"-D[</string>\s]*<string>([^<]+)", plist_content)
+                if match:
+                    instance.data_directory = Path(match.group(1))
+
+                if instance.data_directory:
+                    instance.version = read_pg_version(instance.data_directory)
+                    instance.config_file = instance.data_directory / "postgresql.conf"
+                    instance.port = read_port_from_config(instance.config_file)
+
+                # Check if running via launchctl
+                instance.status = get_launchd_status(stem)
+                instance.pg_ctl_path = find_pg_ctl()
+
+                instances.append(instance)
+
+            except (OSError, IOError):
+                continue
 
     return instances
 
@@ -414,6 +429,7 @@ def find_homebrew_data_dir(service_name: str) -> Optional[Path]:
 def get_launchd_status(service_label: str) -> InstanceStatus:
     """Get the status of a launchd service."""
     try:
+        # Check user-level services first
         result = subprocess.run(
             ["launchctl", "list"],
             capture_output=True,
@@ -422,6 +438,18 @@ def get_launchd_status(service_label: str) -> InstanceStatus:
         )
         if service_label in result.stdout:
             return InstanceStatus.RUNNING
+
+        # Check system-level services (for LaunchDaemons)
+        # launchctl print returns 0 if the service is loaded
+        result = subprocess.run(
+            ["launchctl", "print", f"system/{service_label}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return InstanceStatus.RUNNING
+
         return InstanceStatus.STOPPED
     except (subprocess.TimeoutExpired, subprocess.SubprocessError):
         return InstanceStatus.UNKNOWN
@@ -457,7 +485,7 @@ def discover_process_instances(known_instances: list[PostgreSQLInstance]) -> lis
             instance_name = data_path.parent.name
 
         instance = PostgreSQLInstance(
-            name=f"process-{instance_name}",
+            name=instance_name,
             pid=proc.get("pid"),
             status=InstanceStatus.RUNNING,
             data_directory=data_path,
@@ -592,6 +620,13 @@ def resolve_instance(name: str, instances: list[PostgreSQLInstance]) -> Optional
 # =============================================================================
 
 
+def is_system_launchd(instance: PostgreSQLInstance) -> bool:
+    """Check if this is a system-level launchd service (in /Library/LaunchDaemons/)."""
+    if instance.env_file:
+        return str(instance.env_file).startswith("/Library/LaunchDaemons")
+    return False
+
+
 def get_start_command(instance: PostgreSQLInstance) -> list[str]:
     """Get the command to start an instance."""
     if instance.service_type == ServiceType.SYSTEMD:
@@ -599,7 +634,12 @@ def get_start_command(instance: PostgreSQLInstance) -> list[str]:
     elif instance.service_type == ServiceType.HOMEBREW:
         return ["brew", "services", "start", instance.service_name]
     elif instance.service_type == ServiceType.LAUNCHD:
-        return ["launchctl", "load", str(instance.env_file)]
+        if is_system_launchd(instance):
+            # System service: use kickstart
+            return ["sudo", "launchctl", "kickstart", f"system/{instance.service_name}"]
+        else:
+            # User service: use load
+            return ["launchctl", "load", str(instance.env_file)]
     elif instance.service_type == ServiceType.PGCTL and instance.pg_ctl_path and instance.data_directory:
         cmd = [str(instance.pg_ctl_path), "start", "-D", str(instance.data_directory)]
         if instance.log_file:
@@ -615,7 +655,12 @@ def get_stop_command(instance: PostgreSQLInstance) -> list[str]:
     elif instance.service_type == ServiceType.HOMEBREW:
         return ["brew", "services", "stop", instance.service_name]
     elif instance.service_type == ServiceType.LAUNCHD:
-        return ["launchctl", "unload", str(instance.env_file)]
+        if is_system_launchd(instance):
+            # System service: use kill SIGTERM
+            return ["sudo", "launchctl", "kill", "SIGTERM", f"system/{instance.service_name}"]
+        else:
+            # User service: use unload
+            return ["launchctl", "unload", str(instance.env_file)]
     elif instance.service_type == ServiceType.PGCTL and instance.pg_ctl_path and instance.data_directory:
         return [str(instance.pg_ctl_path), "stop", "-D", str(instance.data_directory), "-m", "fast"]
     return []
@@ -627,6 +672,13 @@ def get_restart_command(instance: PostgreSQLInstance) -> list[str]:
         return ["sudo", "systemctl", "restart", instance.service_name]
     elif instance.service_type == ServiceType.HOMEBREW:
         return ["brew", "services", "restart", instance.service_name]
+    elif instance.service_type == ServiceType.LAUNCHD:
+        if is_system_launchd(instance):
+            # System service: kickstart -k restarts
+            return ["sudo", "launchctl", "kickstart", "-k", f"system/{instance.service_name}"]
+        else:
+            # User service: no direct restart, return empty (caller can stop then start)
+            return []
     elif instance.service_type == ServiceType.PGCTL and instance.pg_ctl_path and instance.data_directory:
         cmd = [str(instance.pg_ctl_path), "restart", "-D", str(instance.data_directory), "-m", "fast"]
         if instance.log_file:
@@ -664,13 +716,27 @@ def run_service_command(cmd: list[str], dry_run: bool = False) -> bool:
 # =============================================================================
 
 
+def service_type_label(service_type: ServiceType) -> str:
+    """Return a friendly label for the service type."""
+    labels = {
+        ServiceType.SYSTEMD: "systemd",
+        ServiceType.HOMEBREW: "homebrew",
+        ServiceType.LAUNCHD: "launchd",
+        ServiceType.PGCTL: "manual",
+        ServiceType.UNKNOWN: "-",
+    }
+    return labels.get(service_type, "-")
+
+
 def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     """Format instances as a table."""
     if not instances:
         return "No PostgreSQL instances found."
 
     # Column headers and widths
-    headers = ["Instance", "Status", "Port", "Version", "Data Directory"]
+    # "Instance" is Linux terminology (systemd template units); use "Name" on macOS
+    name_header = "Instance" if get_platform() == "linux" else "Name"
+    headers = [name_header, "Status", "Port", "Version", "Managed", "Data Directory"]
     rows = []
 
     for inst in instances:
@@ -679,6 +745,7 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
             inst.status.value,
             str(inst.port) if inst.port else "-",
             inst.version or "-",
+            service_type_label(inst.service_type),
             str(inst.data_directory) if inst.data_directory else "-",
         ])
 
