@@ -4,6 +4,8 @@ PostgreSQL Instance Manager
 
 Discovers and manages PostgreSQL instances on Linux and macOS.
 Supports systemd services, Homebrew services, and pg_ctl-managed instances.
+Scans well-known filesystem locations for dormant data directories (e.g.
+after a reboot when no service is configured) and shows advisory notes.
 
 Usage:
     pgstatus.py                     # List all instances
@@ -12,11 +14,13 @@ Usage:
     pgstatus.py start <instance>    # Start an instance
     pgstatus.py stop <instance>     # Stop an instance
     pgstatus.py restart <instance>  # Restart an instance
+    pgstatus.py -D /path/to/pgdata  # Scan a specific data directory
 
 Options:
-    --json      Output as JSON (for list, info)
-    --expand    Show expanded details (for list)
-    --dry-run   Show what would be done (for start/stop/restart)
+    --json          Output as JSON (for list, info)
+    --expand        Show expanded details (for list)
+    --dry-run       Show what would be done (for start/stop/restart)
+    -D, --pgdata    Additional data directory to scan (repeatable)
 """
 
 import argparse
@@ -35,12 +39,14 @@ from typing import Optional
 PG_BASE = Path("/usr/local/postgresql")
 PG_BIN = PG_BASE / "bin"
 PG_CONFIG_BASE = Path("/etc/postgresql")
+PG_MACOS_CONFIG_BASE = Path("/usr/local/etc/postgresql")
 
 
 class InstanceStatus(Enum):
     """Status of a PostgreSQL instance."""
     RUNNING = "running"
     STOPPED = "stopped"
+    DORMANT = "dormant"
     UNKNOWN = "unknown"
 
 
@@ -68,6 +74,8 @@ class PostgreSQLInstance:
     env_file: Optional[Path] = None
     log_file: Optional[Path] = None
     pg_ctl_path: Optional[Path] = None
+    stale_postmaster_pid: bool = False
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -575,11 +583,541 @@ def read_port_from_config(config_file: Path) -> Optional[int]:
 
 
 # =============================================================================
+# Dormant Instance Discovery Helpers
+# =============================================================================
+
+
+def is_pg_data_directory(path: Path) -> bool:
+    """Return True if directory contains PG_VERSION (is a PostgreSQL data dir)."""
+    try:
+        return path.is_dir() and (path / "PG_VERSION").exists()
+    except (OSError, PermissionError):
+        return False
+
+
+def check_stale_postmaster_pid(data_dir: Path) -> tuple[bool, Optional[int], Optional[int]]:
+    """
+    Parse postmaster.pid and check if the PID is still running.
+    Returns (is_stale, pid, port).
+    is_stale is True if postmaster.pid exists but the process is not running.
+    """
+    pid_file = data_dir / "postmaster.pid"
+    if not pid_file.exists():
+        return (False, None, None)
+
+    try:
+        lines = pid_file.read_text().splitlines()
+        pid = int(lines[0].strip()) if len(lines) > 0 else None
+        port = int(lines[3].strip()) if len(lines) > 3 else None
+    except (OSError, ValueError, IndexError, PermissionError):
+        return (False, None, None)
+
+    if pid is None:
+        return (False, None, port)
+
+    # Check if the process is still running
+    try:
+        os.kill(pid, 0)
+        return (False, pid, port)  # Process is running — not stale
+    except ProcessLookupError:
+        return (True, pid, port)  # PID doesn't exist — stale
+    except PermissionError:
+        return (False, pid, port)  # Can't signal it, assume running
+
+
+def get_pg_ctl_version(pg_ctl_path: Path) -> Optional[int]:
+    """Run pg_ctl --version and extract the major version number."""
+    try:
+        result = subprocess.run(
+            [str(pg_ctl_path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            match = re.search(r"(\d+)(?:\.\d+)?", result.stdout)
+            if match:
+                return int(match.group(1))
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def read_postmaster_opts(data_dir: Path) -> Optional[str]:
+    """Read postmaster.opts to show how the instance was previously started."""
+    opts_file = data_dir / "postmaster.opts"
+    try:
+        if opts_file.exists():
+            return opts_file.read_text().strip()
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def scan_directory_for_pg_data(base_path: Path, max_depth: int = 2) -> list[Path]:
+    """
+    Recursively scan a directory up to max_depth levels for subdirectories
+    containing PG_VERSION. Skips symlinks. Returns list of Paths.
+    """
+    results = []
+    if not base_path.is_dir():
+        return results
+
+    def _scan(path: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            for entry in path.iterdir():
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if is_pg_data_directory(entry):
+                        results.append(entry)
+                    else:
+                        _scan(entry, depth + 1)
+        except PermissionError:
+            pass
+
+    # Check the base_path itself first
+    if is_pg_data_directory(base_path):
+        results.append(base_path)
+    else:
+        _scan(base_path, 0)
+
+    return results
+
+
+def scan_log_dirs_for_data_paths() -> list[tuple[Path, Optional[int], Optional[str], Path]]:
+    """
+    Scan log directories for PostgreSQL log files that contain breadcrumbs
+    about data directories.
+
+    Returns list of (data_dir, port, version, log_file_path) tuples.
+    """
+    log_dirs = [
+        Path("/var/log/postgresql/"),
+        Path("/usr/local/var/log/postgresql/"),
+    ]
+
+    results = []
+    seen_data_dirs = set()
+
+    for log_dir in log_dirs:
+        if not log_dir.is_dir():
+            continue
+        try:
+            for log_file in log_dir.glob("*.log"):
+                if not log_file.is_file():
+                    continue
+                try:
+                    data_dir = None
+                    port = None
+                    version = None
+
+                    # Read just the first ~50 lines (startup messages)
+                    with open(log_file) as f:
+                        for line_num, line in enumerate(f):
+                            if line_num >= 50:
+                                break
+
+                            # Extract data dir from pg_hba.conf references
+                            # Format in logs: (/path/to/pg_hba.conf:121)
+                            m = re.search(r'(/[^():\s]+/pg_hba\.conf)', line)
+                            if m:
+                                hba_path = Path(m.group(1))
+                                data_dir = hba_path.parent
+
+                            # Extract version from startup line
+                            m = re.search(r"starting PostgreSQL (\d+(?:\.\d+)?)", line)
+                            if m:
+                                version = m.group(1)
+
+                            # Extract port from listening line
+                            m = re.search(r"listening on .+ port (\d+)", line)
+                            if m:
+                                port = int(m.group(1))
+
+                    if data_dir and str(data_dir) not in seen_data_dirs:
+                        seen_data_dirs.add(str(data_dir))
+                        results.append((data_dir, port, version, log_file))
+
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            continue
+
+    return results
+
+
+# =============================================================================
+# Dormant / Unconfigured Instance Discovery
+# =============================================================================
+
+
+def discover_dormant_instances(
+    known_instances: list[PostgreSQLInstance],
+    extra_paths: Optional[list[Path]] = None,
+) -> list[PostgreSQLInstance]:
+    """
+    Scan well-known locations + log breadcrumbs for data directories not
+    already found by service-based or process-based discovery.
+    """
+    instances = []
+    known_data_dirs = {str(i.data_directory) for i in known_instances if i.data_directory}
+
+    plat = get_platform()
+
+    # Scan paths common to both platforms
+    scan_paths = [
+        Path("/usr/local/postgresql/data/"),
+        Path("/usr/local/pgdata/"),
+        Path("/usr/local/pgsql/data/"),       # source install default
+    ]
+
+    if plat == "linux":
+        scan_paths.extend([
+            Path("/var/lib/postgresql/"),      # Debian/Ubuntu
+            Path("/var/lib/pgsql/"),           # RHEL/CentOS/Fedora
+            Path("/var/lib/pgsql/data/"),      # older RHEL single-instance
+        ])
+
+    if plat == "darwin":
+        scan_paths.extend([
+            Path("/usr/local/var/postgres/"),          # Homebrew (Intel)
+            Path("/opt/homebrew/var/postgres/"),        # Homebrew (Apple Silicon)
+            Path("/usr/local/var/postgresql@17/"),      # Homebrew versioned (Intel)
+            Path("/usr/local/var/postgresql@16/"),
+            Path("/usr/local/var/postgresql@15/"),
+            Path("/opt/homebrew/var/postgresql@17/"),   # Homebrew versioned (Apple Silicon)
+            Path("/opt/homebrew/var/postgresql@16/"),
+            Path("/opt/homebrew/var/postgresql@15/"),
+            Path.home() / "Library" / "Application Support" / "Postgres",  # Postgres.app
+        ])
+
+    # Add user-provided paths
+    if extra_paths:
+        scan_paths.extend(extra_paths)
+
+    # Filesystem scan
+    found_dirs: list[Path] = []
+    for base in scan_paths:
+        found_dirs.extend(scan_directory_for_pg_data(base))
+
+    # Log breadcrumb scan
+    log_results = scan_log_dirs_for_data_paths()
+    log_map: dict[str, tuple[Optional[int], Optional[str], Path]] = {}
+    for data_dir, port, version, log_path in log_results:
+        log_map[str(data_dir)] = (port, version, log_path)
+        # If the data dir wasn't found by filesystem scan but exists on disk, add it
+        if str(data_dir) not in {str(d) for d in found_dirs} and data_dir.is_dir():
+            found_dirs.append(data_dir)
+
+    pg_ctl_path = find_pg_ctl()
+    pg_ctl_major = get_pg_ctl_version(pg_ctl_path) if pg_ctl_path else None
+
+    for data_dir in found_dirs:
+        dir_str = str(data_dir)
+        if dir_str in known_data_dirs:
+            # Attach log file to the existing instance if found in log scan
+            if dir_str in log_map:
+                _, _, log_path = log_map[dir_str]
+                for inst in known_instances:
+                    if str(inst.data_directory) == dir_str and inst.log_file is None:
+                        inst.log_file = log_path
+            continue
+
+        # Generate instance name from directory structure
+        instance_name = data_dir.name
+        if instance_name in ("data", "pgdata"):
+            instance_name = data_dir.parent.name
+
+        notes: list[str] = []
+
+        # Read version from PG_VERSION
+        version = read_pg_version(data_dir)
+
+        # Read port from postgresql.conf
+        config_file = data_dir / "postgresql.conf"
+        port = read_port_from_config(config_file) if config_file.exists() else None
+
+        # Log breadcrumb enrichment
+        log_file = None
+        if dir_str in log_map:
+            log_port, log_version, log_path = log_map[dir_str]
+            log_file = log_path
+            if port is None and log_port is not None:
+                port = log_port
+            if version is None and log_version is not None:
+                version = log_version
+
+        # Check for stale postmaster.pid
+        is_stale, stale_pid, pid_port = check_stale_postmaster_pid(data_dir)
+        stale_postmaster = False
+        if is_stale:
+            stale_postmaster = True
+            notes.append(
+                f"Stale postmaster.pid found (PID {stale_pid} is not running). "
+                f"Remove {data_dir}/postmaster.pid before starting."
+            )
+            if pid_port and port is None:
+                port = pid_port
+
+        # Read postmaster.opts
+        prev_opts = read_postmaster_opts(data_dir)
+        if prev_opts:
+            notes.append(f"Previously started as: {prev_opts}")
+
+        # Check pg_ctl version compatibility
+        if pg_ctl_path and pg_ctl_major and version:
+            try:
+                data_major = int(version.split(".")[0])
+                if data_major != pg_ctl_major:
+                    notes.append(
+                        f"Version mismatch: data directory is PG {version} "
+                        f"but pg_ctl is PG {pg_ctl_major}. "
+                        f"Use a matching pg_ctl to start this instance."
+                    )
+            except ValueError:
+                pass
+
+        # Reboot warning
+        if plat == "darwin":
+            notes.append(
+                "No service configured — starting with pg_ctl won't survive reboot. "
+                "Use create_pg_service_macos.py to create a persistent service."
+            )
+        else:
+            notes.append(
+                "No service configured — starting with pg_ctl won't survive reboot. "
+                "Use create_pg_service.py to create a persistent service."
+            )
+
+        instance = PostgreSQLInstance(
+            name=instance_name,
+            status=InstanceStatus.DORMANT,
+            data_directory=data_dir,
+            port=port,
+            version=version,
+            service_type=ServiceType.PGCTL,
+            config_file=config_file if config_file.exists() else None,
+            log_file=log_file,
+            pg_ctl_path=pg_ctl_path,
+            stale_postmaster_pid=stale_postmaster,
+            notes=notes,
+        )
+
+        instances.append(instance)
+        known_data_dirs.add(dir_str)
+
+    return instances
+
+
+def discover_macos_config_instances(
+    known_instances: list[PostgreSQLInstance],
+) -> list[PostgreSQLInstance]:
+    """
+    Scan /usr/local/etc/postgresql/<instance>/ config dirs created by
+    create_pg_service_macos.py. If the config exists but no launchd plist
+    is loaded, report as DORMANT.
+    """
+    instances = []
+
+    if get_platform() != "darwin":
+        return instances
+
+    if not PG_MACOS_CONFIG_BASE.exists():
+        return instances
+
+    known_data_dirs = {str(i.data_directory) for i in known_instances if i.data_directory}
+    known_names = {i.name for i in known_instances}
+
+    for instance_dir in PG_MACOS_CONFIG_BASE.iterdir():
+        if not instance_dir.is_dir():
+            continue
+
+        env_file = instance_dir / "postgresql.conf"
+        if not env_file.exists():
+            continue
+
+        instance_name = instance_dir.name
+
+        # Parse the environment file for PGDATA, PGPORT, PGLOG
+        config = {}
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+        except (OSError, PermissionError):
+            continue
+
+        data_dir = Path(config["PGDATA"]) if "PGDATA" in config else None
+
+        # Skip if already known
+        if instance_name in known_names:
+            continue
+        if data_dir and str(data_dir) in known_data_dirs:
+            continue
+
+        port = None
+        if "PGPORT" in config:
+            try:
+                port = int(config["PGPORT"])
+            except ValueError:
+                pass
+
+        log_file = Path(config["PGLOG"]) if "PGLOG" in config else None
+
+        # Check if launchd plist is loaded
+        plist_label = f"com.postgresql.{instance_name}"
+        status = get_launchd_status(plist_label)
+
+        if status == InstanceStatus.RUNNING:
+            continue  # Already running, should have been found by launchd discovery
+
+        version = read_pg_version(data_dir) if data_dir and data_dir.is_dir() else None
+
+        notes = [
+            f"Config exists at {env_file} but launchd service is not loaded. "
+            f"Run: sudo launchctl bootstrap system /Library/LaunchDaemons/{plist_label}.plist"
+        ]
+
+        instance = PostgreSQLInstance(
+            name=instance_name,
+            status=InstanceStatus.DORMANT,
+            data_directory=data_dir,
+            port=port,
+            version=version,
+            service_type=ServiceType.LAUNCHD,
+            service_name=plist_label,
+            env_file=env_file,
+            log_file=log_file,
+            config_file=data_dir / "postgresql.conf" if data_dir else None,
+            pg_ctl_path=find_pg_ctl(),
+            notes=notes,
+        )
+
+        instances.append(instance)
+        if data_dir:
+            known_data_dirs.add(str(data_dir))
+
+    return instances
+
+
+def discover_disabled_systemd_instances(
+    known_instances: list[PostgreSQLInstance],
+) -> list[PostgreSQLInstance]:
+    """
+    Find disabled/failed systemd template units not caught by
+    discover_systemd_instances(). Reports them as STOPPED with notes.
+    """
+    instances = []
+
+    if get_platform() != "linux":
+        return instances
+
+    known_names = {i.name for i in known_instances}
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "list-units", "--all", "--type=service",
+             "--no-legend", "--no-pager", "postgresql@*"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return instances
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            unit_name = parts[0]  # e.g. postgresql@foo.service
+            active_state = parts[2]  # active, inactive, failed
+            sub_state = parts[3]  # running, dead, failed, etc.
+
+            # Extract instance name from unit
+            match = re.match(r"postgresql@(.+)\.service", unit_name)
+            if not match:
+                continue
+            instance_name = match.group(1)
+
+            if instance_name in known_names:
+                continue
+
+            notes = []
+            if active_state == "failed" or sub_state == "failed":
+                notes.append(
+                    f"Service {unit_name} is in failed state. "
+                    f"Check: journalctl -u {unit_name}"
+                )
+
+            status = InstanceStatus.STOPPED
+
+            # Try to get data dir from config
+            env_file = PG_CONFIG_BASE / instance_name / "postgresql.conf"
+            data_dir = None
+            port = None
+            log_file = None
+            version = None
+
+            if env_file.exists():
+                try:
+                    config = {}
+                    for cfg_line in env_file.read_text().splitlines():
+                        cfg_line = cfg_line.strip()
+                        if "=" in cfg_line and not cfg_line.startswith("#"):
+                            key, value = cfg_line.split("=", 1)
+                            config[key.strip()] = value.strip()
+                    if "PGDATA" in config:
+                        data_dir = Path(config["PGDATA"])
+                    if "PGPORT" in config:
+                        try:
+                            port = int(config["PGPORT"])
+                        except ValueError:
+                            pass
+                    if "PGLOG" in config:
+                        log_file = Path(config["PGLOG"])
+                except (OSError, PermissionError):
+                    pass
+
+            if data_dir:
+                version = read_pg_version(data_dir)
+
+            instance = PostgreSQLInstance(
+                name=instance_name,
+                status=status,
+                data_directory=data_dir,
+                port=port,
+                version=version,
+                service_type=ServiceType.SYSTEMD,
+                service_name=f"postgresql@{instance_name}",
+                env_file=env_file if env_file.exists() else None,
+                log_file=log_file,
+                config_file=data_dir / "postgresql.conf" if data_dir else None,
+                pg_ctl_path=find_pg_ctl(),
+                notes=notes,
+            )
+
+            instances.append(instance)
+
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+        pass
+
+    return instances
+
+
+# =============================================================================
 # Instance Resolution
 # =============================================================================
 
 
-def discover_all_instances() -> list[PostgreSQLInstance]:
+def discover_all_instances(
+    extra_paths: Optional[list[Path]] = None,
+) -> list[PostgreSQLInstance]:
     """Discover all PostgreSQL instances on the system."""
     instances = []
 
@@ -587,15 +1125,27 @@ def discover_all_instances() -> list[PostgreSQLInstance]:
 
     if plat == "linux":
         instances.extend(discover_systemd_instances())
+        instances.extend(discover_disabled_systemd_instances(instances))
     elif plat == "darwin":
         instances.extend(discover_homebrew_instances())
         instances.extend(discover_launchd_instances())
+        instances.extend(discover_macos_config_instances(instances))
 
     # Add process-based instances (running instances not found by other methods)
     instances.extend(discover_process_instances(instances))
 
-    # Sort by name
-    instances.sort(key=lambda i: i.name)
+    # Dormant discovery: filesystem + log breadcrumb scan as final catch-all
+    instances.extend(discover_dormant_instances(instances, extra_paths=extra_paths))
+
+    # Sort: running first, then stopped, then dormant, then unknown;
+    # alphabetical within each group
+    status_order = {
+        InstanceStatus.RUNNING: 0,
+        InstanceStatus.STOPPED: 1,
+        InstanceStatus.DORMANT: 2,
+        InstanceStatus.UNKNOWN: 3,
+    }
+    instances.sort(key=lambda i: (status_order.get(i.status, 99), i.name))
 
     return instances
 
@@ -731,7 +1281,10 @@ def service_type_label(service_type: ServiceType) -> str:
 def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     """Format instances as a table."""
     if not instances:
-        return "No PostgreSQL instances found."
+        return (
+            "No PostgreSQL instances found.\n"
+            "Tip: Use -D /path/to/pgdata to check a specific data directory."
+        )
 
     # Column headers and widths
     # "Instance" is Linux terminology (systemd template units); use "Name" on macOS
@@ -767,6 +1320,15 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     for row in rows:
         lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
 
+    # Notes footer for dormant instances
+    dormant_with_notes = [i for i in instances if i.status == InstanceStatus.DORMANT and i.notes]
+    if dormant_with_notes:
+        lines.append("")
+        lines.append("Notes:")
+        for inst in dormant_with_notes:
+            for note in inst.notes:
+                lines.append(f"  {inst.name}: {note}")
+
     return "\n".join(lines)
 
 
@@ -778,7 +1340,10 @@ def format_list_json(instances: list[PostgreSQLInstance]) -> str:
 def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
     """Format instances with expanded details."""
     if not instances:
-        return "No PostgreSQL instances found."
+        return (
+            "No PostgreSQL instances found.\n"
+            "Tip: Use -D /path/to/pgdata to check a specific data directory."
+        )
 
     lines = []
 
@@ -787,7 +1352,12 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             lines.append("")  # Blank line between instances
 
         # Instance header
-        status_indicator = "+" if inst.status == InstanceStatus.RUNNING else "-"
+        if inst.status == InstanceStatus.RUNNING:
+            status_indicator = "+"
+        elif inst.status == InstanceStatus.DORMANT:
+            status_indicator = "~"
+        else:
+            status_indicator = "-"
         lines.append(f"[{status_indicator}] {inst.name}")
         lines.append("-" * (len(inst.name) + 4))
 
@@ -795,6 +1365,8 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
         lines.append(f"    Status:      {inst.status.value}")
         if inst.pid:
             lines.append(f"    PID:         {inst.pid}")
+        if inst.stale_postmaster_pid:
+            lines.append(f"    Stale PID:   yes (postmaster.pid exists but process not running)")
 
         # Configuration
         lines.append(f"    Port:        {inst.port or '-'}")
@@ -828,6 +1400,13 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             lines.append(f"      Status:    systemctl status {inst.service_name}")
             lines.append(f"      Logs:      journalctl -u {inst.service_name}")
 
+        # Notes
+        if inst.notes:
+            lines.append("")
+            lines.append("    Notes:")
+            for note in inst.notes:
+                lines.append(f"      - {note}")
+
     return "\n".join(lines)
 
 
@@ -843,6 +1422,8 @@ def format_info(instance: PostgreSQLInstance) -> str:
     lines.append(f"  Running:     {instance.status.value}")
     if instance.pid:
         lines.append(f"  PID:         {instance.pid}")
+    if instance.stale_postmaster_pid:
+        lines.append(f"  Stale PID:   yes (postmaster.pid exists but process not running)")
     lines.append("")
 
     # Configuration section
@@ -888,6 +1469,13 @@ def format_info(instance: PostgreSQLInstance) -> str:
         lines.append(f"  Status:      systemctl status {instance.service_name}")
         lines.append(f"  Logs:        journalctl -u {instance.service_name}")
 
+    # Notes section
+    if instance.notes:
+        lines.append("")
+        lines.append("Notes:")
+        for note in instance.notes:
+            lines.append(f"  - {note}")
+
     return "\n".join(lines)
 
 
@@ -926,14 +1514,19 @@ _pgstatus_completions() {
             COMPREPLY=( $(compgen -W "${instances}" -- "${cur}") )
             return 0
             ;;
+        -D|--pgdata)
+            # Complete with directories
+            COMPREPLY=( $(compgen -d -- "${cur}") )
+            return 0
+            ;;
         pgstatus.py|./pgstatus.py)
-            COMPREPLY=( $(compgen -W "${commands} --json --expand --dry-run --completions --help" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "${commands} --json --expand --dry-run --completions --pgdata -D --help" -- "${cur}") )
             return 0
             ;;
     esac
 
     if [[ "${cur}" == -* ]]; then
-        COMPREPLY=( $(compgen -W "--json --expand --dry-run --completions --help" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --expand --dry-run --completions --pgdata -D --help" -- "${cur}") )
         return 0
     fi
 
@@ -967,6 +1560,8 @@ _pgstatus() {
         '--dry-run[Show what would be done]' \\
         '--completions[Output shell completion script]' \\
         '--help[Show help message]' \\
+        '*-D[Additional data directory to scan]:directory:_files -/' \\
+        '*--pgdata[Additional data directory to scan]:directory:_files -/' \\
         '1:command:->command' \\
         '2:instance:->instance'
 
@@ -1006,6 +1601,7 @@ Examples:
   %(prog)s stop main            # Stop the 'main' instance
   %(prog)s restart main         # Restart the 'main' instance
   %(prog)s stop main --dry-run  # Show what would be done
+  %(prog)s -D /path/to/pgdata   # Scan a specific data directory
 
 Service management commands (start/stop/restart) may require sudo for
 systemd-managed instances.
@@ -1044,6 +1640,12 @@ systemd-managed instances.
         action="store_true",
         help="Output shell completion script",
     )
+    parser.add_argument(
+        "-D", "--pgdata",
+        action="append",
+        metavar="DIR",
+        help="Additional data directory to scan (repeatable)",
+    )
 
     return parser.parse_args()
 
@@ -1063,7 +1665,8 @@ def main() -> int:
         return 0
 
     # Discover instances
-    instances = discover_all_instances()
+    extra_paths = [Path(p) for p in args.pgdata] if args.pgdata else None
+    instances = discover_all_instances(extra_paths=extra_paths)
 
     # Handle commands
     if args.command == "list":
@@ -1114,6 +1717,9 @@ def main() -> int:
 
         if not cmd:
             print(f"Error: Cannot {args.command} instance '{instance.name}' - unknown service type.", file=sys.stderr)
+            if instance.notes:
+                for note in instance.notes:
+                    print(f"  Note: {note}", file=sys.stderr)
             return 1
 
         success = run_service_command(cmd, args.dry_run)

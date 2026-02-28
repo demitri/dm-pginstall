@@ -707,6 +707,14 @@ def build_icu(version: str, dry_run: bool = False, verbose: bool = False) -> Non
     file_version = f"{version_parts[0]}_{version_parts[1]}"
     url = f"https://github.com/unicode-org/icu/releases/download/release-{tag_version}/icu4c-{file_version}-src.tgz"
 
+    # ICU always extracts to 'icu/' regardless of version, so stale build
+    # artifacts from a previous version would cause symbol mismatches.
+    # Remove the old source directory before extracting.
+    icu_src_dir = SRC_DIR / "icu"
+    if icu_src_dir.exists() and not dry_run:
+        print(f"  Removing old ICU source directory: {icu_src_dir}")
+        shutil.rmtree(icu_src_dir)
+
     src_path = download_and_extract(url, SRC_DIR, dry_run)
     # ICU extracts to 'icu' directory, source is in 'icu/source'
     if not dry_run:
