@@ -690,7 +690,7 @@ def load_versions(config_path: Optional[Path], exclude_ast: bool = False) -> dic
 # =============================================================================
 
 
-def build_readline(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_readline(version: str, dry_run: bool = False, verbose: bool = False, no_alias: bool = False) -> None:
     """Build readline from source (macOS only)."""
     install_path = INSTALL_BASE / f"readline-{version}"
     symlink_path = INSTALL_BASE / "readline"
@@ -701,7 +701,8 @@ def build_readline(version: str, dry_run: bool = False, verbose: bool = False) -
 
     if check_existing(install_path):
         print(f"  Already installed: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if not no_alias:
+            create_symlink(install_path, symlink_path, dry_run)
         return
 
     # Download and extract
@@ -739,11 +740,12 @@ def build_readline(version: str, dry_run: bool = False, verbose: bool = False) -
         print("  Would configure, build, and install readline")
 
     # Create symlink
-    create_symlink(install_path, symlink_path, dry_run)
+    if not no_alias:
+        create_symlink(install_path, symlink_path, dry_run)
     print(f"  readline {version} installed successfully")
 
 
-def build_icu(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_icu(version: str, dry_run: bool = False, verbose: bool = False, no_alias: bool = False) -> None:
     """Build ICU from source."""
     install_path = INSTALL_BASE / f"icu-{version}"
     symlink_path = INSTALL_BASE / "icu"
@@ -754,7 +756,8 @@ def build_icu(version: str, dry_run: bool = False, verbose: bool = False) -> Non
 
     if check_existing(install_path):
         print(f"  Already installed: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if not no_alias:
+            create_symlink(install_path, symlink_path, dry_run)
         return
 
     # Download and extract
@@ -890,11 +893,12 @@ def build_icu(version: str, dry_run: bool = False, verbose: bool = False) -> Non
         print("  Would run rpath fixer on ICU libraries")
 
     # Create symlink
-    create_symlink(install_path, symlink_path, dry_run)
+    if not no_alias:
+        create_symlink(install_path, symlink_path, dry_run)
     print(f"  ICU {version} installed successfully")
 
 
-def build_openssl(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_openssl(version: str, dry_run: bool = False, verbose: bool = False, no_alias: bool = False) -> None:
     """Build OpenSSL from source."""
     install_path = INSTALL_BASE / f"openssl-{version}"
     symlink_path = INSTALL_BASE / "openssl"
@@ -905,7 +909,8 @@ def build_openssl(version: str, dry_run: bool = False, verbose: bool = False) ->
 
     if check_existing(install_path):
         print(f"  Already installed: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if not no_alias:
+            create_symlink(install_path, symlink_path, dry_run)
         return
 
     # Download and extract
@@ -947,12 +952,14 @@ def build_openssl(version: str, dry_run: bool = False, verbose: bool = False) ->
         print("  Would configure, build, and install OpenSSL")
 
     # Create symlink
-    create_symlink(install_path, symlink_path, dry_run)
+    if not no_alias:
+        create_symlink(install_path, symlink_path, dry_run)
     print(f"  OpenSSL {version} installed successfully")
 
 
 def build_postgresql(
-    version: str, dry_run: bool = False, verbose: bool = False, with_llvm: bool = False
+    version: str, dry_run: bool = False, verbose: bool = False,
+    with_llvm: bool = False, no_alias: bool = False,
 ) -> None:
     """Build PostgreSQL from source."""
     install_path = INSTALL_BASE / f"postgresql-{version}"
@@ -965,7 +972,7 @@ def build_postgresql(
     # Check for existing installations
     existing_installations = find_existing_postgresql_installations()
     current_symlink_target = get_symlink_target(symlink_path)
-    update_symlink = True  # Default to updating symlink
+    update_symlink = not no_alias  # Default to updating symlink unless --no-alias
 
     if existing_installations:
         # Check if there are OTHER versions installed (not the one we're installing)
@@ -1257,7 +1264,7 @@ def build_q3c(version: str, dry_run: bool = False, verbose: bool = False) -> Non
     print(f"  q3c {version} installed successfully")
 
 
-def build_ast(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_ast(version: str, dry_run: bool = False, verbose: bool = False, no_alias: bool = False) -> None:
     """Build Starlink AST library from source."""
     install_path = INSTALL_BASE / f"ast-{version}"
     symlink_path = INSTALL_BASE / "ast"
@@ -1268,7 +1275,8 @@ def build_ast(version: str, dry_run: bool = False, verbose: bool = False) -> Non
 
     if check_existing(install_path):
         print(f"  Already installed: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if not no_alias:
+            create_symlink(install_path, symlink_path, dry_run)
         return
 
     # Download release tarball (use the pre-built release asset, not the source tarball)
@@ -1279,7 +1287,8 @@ def build_ast(version: str, dry_run: bool = False, verbose: bool = False) -> Non
         src_path = SRC_DIR / f"ast-{version}"
         print(f"  Would build AST from: {src_path}")
         print(f"  Would install to: {install_path}")
-        create_symlink(install_path, symlink_path, dry_run)
+        if not no_alias:
+            create_symlink(install_path, symlink_path, dry_run)
         return
 
     env = get_sanitized_env()
@@ -1327,7 +1336,8 @@ def build_ast(version: str, dry_run: bool = False, verbose: bool = False) -> Non
     )
 
     # Create symlink
-    create_symlink(install_path, symlink_path, dry_run)
+    if not no_alias:
+        create_symlink(install_path, symlink_path, dry_run)
     print(f"  AST {version} installed successfully")
 
 
@@ -1424,7 +1434,7 @@ _{script_name.replace("-", "_").replace(".", "_")}_completions() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --verbose --completions --help"
+    opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --no-alias --verbose --completions --help"
     components="readline openssl icu postgresql contrib q3c ast pgast"
 
     case "${{prev}}" in
@@ -1469,6 +1479,7 @@ _pginstall() {{
         '--skip-extensions[Skip q3c, ast, and pgast extensions]'
         '--exclude-ast[Exclude Starlink AST library and pgast]'
         '--with-llvm[Enable LLVM/JIT support (opt-in on macOS, auto on Linux)]'
+        '--no-alias[Skip creating/updating symlinks in /usr/local]'
         '--verbose[Show all build output]'
         '--completions[Output shell completion script]:shell:(bash zsh)'
         '--help[Show help message]'
@@ -1544,6 +1555,11 @@ Shell completions:
         "--with-llvm",
         action="store_true",
         help="Enable LLVM/JIT support (opt-in on macOS, auto-detected on Linux)",
+    )
+    parser.add_argument(
+        "--no-alias",
+        action="store_true",
+        help="Skip creating/updating symlinks in /usr/local",
     )
     parser.add_argument(
         "--verbose",
@@ -1904,19 +1920,20 @@ def main() -> None:
                         print(f"  LLVM not found. To install: {install_cmd}")
 
     # Build components
+    na = args.no_alias
     if args.component:
         # Build only specified component
         if args.component == "readline":
             if plat == "darwin":
-                build_readline(versions["readline"], args.dry_run, args.verbose)
+                build_readline(versions["readline"], args.dry_run, args.verbose, no_alias=na)
             else:
                 print("readline is only built from source on macOS")
         elif args.component == "openssl":
-            build_openssl(versions["openssl"], args.dry_run, args.verbose)
+            build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
         elif args.component == "icu":
-            build_icu(versions["icu"], args.dry_run, args.verbose)
+            build_icu(versions["icu"], args.dry_run, args.verbose, no_alias=na)
         elif args.component == "postgresql":
-            build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm)
+            build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm, no_alias=na)
         elif args.component == "contrib":
             build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
         elif args.component == "q3c":
@@ -1925,7 +1942,7 @@ def main() -> None:
             if args.exclude_ast:
                 print("AST is excluded (--exclude-ast)")
             else:
-                build_ast(versions["ast"], args.dry_run, args.verbose)
+                build_ast(versions["ast"], args.dry_run, args.verbose, no_alias=na)
         elif args.component == "pgast":
             if args.exclude_ast:
                 print("pgast is excluded (--exclude-ast)")
@@ -1934,17 +1951,17 @@ def main() -> None:
     else:
         # Build everything in order
         if plat == "darwin":
-            build_readline(versions["readline"], args.dry_run, args.verbose)
+            build_readline(versions["readline"], args.dry_run, args.verbose, no_alias=na)
 
-        build_openssl(versions["openssl"], args.dry_run, args.verbose)
-        build_icu(versions["icu"], args.dry_run, args.verbose)
-        build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm)
+        build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
+        build_icu(versions["icu"], args.dry_run, args.verbose, no_alias=na)
+        build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm, no_alias=na)
         build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
 
         if not args.skip_extensions:
             build_q3c(versions["q3c"], args.dry_run, args.verbose)
             if not args.exclude_ast:
-                build_ast(versions["ast"], args.dry_run, args.verbose)
+                build_ast(versions["ast"], args.dry_run, args.verbose, no_alias=na)
                 build_pgast(versions["pgast"], args.dry_run, args.verbose)
 
     print(f"\n{'=' * 60}")
