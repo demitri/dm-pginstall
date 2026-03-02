@@ -183,6 +183,7 @@ test_extension() {
 test_extension "citext" "SELECT 'Hello'::citext = 'HELLO'::citext;"
 test_extension "cube" "SELECT cube(1,2,3);"
 test_extension "earthdistance" "SELECT earth_distance(ll_to_earth(40.7, -74.0), ll_to_earth(34.0, -118.2));"
+test_extension "pgcrypto" "SELECT gen_random_uuid();"
 test_extension "pg_trgm" "SELECT similarity('word', 'words');"
 
 # External extensions

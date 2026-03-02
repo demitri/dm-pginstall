@@ -13,6 +13,7 @@ Options:
     --dry-run          Show what would be done without executing
     --component NAME   Build only specific component
     --skip-extensions  Skip q3c and pgast
+    --with-llvm        Enable LLVM/JIT support (required on macOS, auto on Linux)
     --verbose          Show all build output
 """
 
@@ -43,7 +44,7 @@ GITHUB_API = "https://api.github.com"
 GFORTRAN_MACOS_RELEASES = "https://github.com/fxcoudert/gfortran-for-macOS/releases"
 
 # Contrib extensions to build
-CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "pg_trgm"]
+CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "pgcrypto", "pg_trgm"]
 
 
 def get_platform() -> str:
@@ -266,6 +267,41 @@ def get_llvm_install_command() -> Optional[str]:
 def check_existing(install_path: Path) -> bool:
     """Return True if installation already exists."""
     return install_path.is_dir()
+
+
+def get_pg_configure_flags(install_path: Path) -> Optional[str]:
+    """Get the configure flags used to build an existing PostgreSQL installation.
+
+    Returns the configure string from pg_config, or None if pg_config is not found.
+    """
+    pg_config = install_path / "bin" / "pg_config"
+    if not pg_config.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(pg_config), "--configure"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def check_pg_needs_rebuild(install_path: Path, required_flags: list[str]) -> list[str]:
+    """Check if an existing PostgreSQL installation is missing required configure flags.
+
+    Returns a list of missing flags, or an empty list if all are present.
+    """
+    configure_str = get_pg_configure_flags(install_path)
+    if configure_str is None:
+        # Can't determine — assume it's fine
+        return []
+    missing = [flag for flag in required_flags if flag not in configure_str]
+    return missing
 
 
 def find_existing_postgresql_installations() -> list[tuple[str, Path]]:
@@ -492,6 +528,26 @@ def get_latest_icu_version() -> str:
     sys.exit(1)
 
 
+def get_latest_openssl_version() -> str:
+    """Query GitHub API for latest OpenSSL 3.x release version."""
+    print("  Detecting latest OpenSSL version...")
+    releases = github_api_get("/repos/openssl/openssl/releases")
+    for release in releases:
+        if release.get("prerelease", False):
+            continue
+        tag = release.get("tag_name", "")
+        # OpenSSL tags are like "openssl-3.6.1"
+        match = re.match(r"openssl-(\d+\.\d+\.\d+)", tag)
+        if match:
+            version = match.group(1)
+            major = int(version.split(".")[0])
+            if major >= 3:
+                print(f"  Latest OpenSSL version: {version}")
+                return version
+    print("Error: Could not determine latest OpenSSL version", file=sys.stderr)
+    sys.exit(1)
+
+
 def get_latest_postgresql_version() -> str:
     """Parse PostgreSQL FTP listing for latest version."""
     print("  Detecting latest PostgreSQL version...")
@@ -607,6 +663,7 @@ def load_versions(config_path: Optional[Path], exclude_ast: bool = False) -> dic
     print("\nDetecting versions...")
     if plat == "darwin":
         versions["readline"] = get_latest_readline_version()
+    versions["openssl"] = get_latest_openssl_version()
     versions["icu"] = get_latest_icu_version()
     versions["postgresql"] = get_latest_postgresql_version()
     versions["q3c"] = get_latest_q3c_version()
@@ -837,8 +894,65 @@ def build_icu(version: str, dry_run: bool = False, verbose: bool = False) -> Non
     print(f"  ICU {version} installed successfully")
 
 
+def build_openssl(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+    """Build OpenSSL from source."""
+    install_path = INSTALL_BASE / f"openssl-{version}"
+    symlink_path = INSTALL_BASE / "openssl"
+
+    print(f"\n{'=' * 60}")
+    print(f"Building OpenSSL {version}")
+    print(f"{'=' * 60}")
+
+    if check_existing(install_path):
+        print(f"  Already installed: {install_path}")
+        create_symlink(install_path, symlink_path, dry_run)
+        return
+
+    # Download and extract
+    url = f"https://github.com/openssl/openssl/releases/download/openssl-{version}/openssl-{version}.tar.gz"
+    src_path = download_and_extract(url, SRC_DIR, dry_run)
+
+    if not dry_run:
+        # OpenSSL uses ./config instead of ./configure
+        run_build_cmd(
+            [
+                "./config",
+                f"--prefix={install_path}",
+                f"--openssldir={install_path}",
+            ],
+            cwd=src_path,
+            dry_run=dry_run,
+            verbose=verbose,
+            description="Configuring OpenSSL...",
+        )
+
+        # Build
+        run_build_cmd(
+            ["make", f"-j{get_cpu_count()}"],
+            cwd=src_path,
+            dry_run=dry_run,
+            verbose=verbose,
+            description="Building OpenSSL...",
+        )
+
+        # Install
+        run_build_cmd(
+            ["sudo", "make", "install"],
+            cwd=src_path,
+            dry_run=dry_run,
+            verbose=verbose,
+            description="Installing OpenSSL...",
+        )
+    else:
+        print("  Would configure, build, and install OpenSSL")
+
+    # Create symlink
+    create_symlink(install_path, symlink_path, dry_run)
+    print(f"  OpenSSL {version} installed successfully")
+
+
 def build_postgresql(
-    version: str, dry_run: bool = False, verbose: bool = False
+    version: str, dry_run: bool = False, verbose: bool = False, with_llvm: bool = False
 ) -> None:
     """Build PostgreSQL from source."""
     install_path = INSTALL_BASE / f"postgresql-{version}"
@@ -878,17 +992,45 @@ def build_postgresql(
                 else:
                     print(f"  Would ask whether to update symlink to version {version}")
 
-    if check_existing(install_path):
-        print(f"  Already installed: {install_path}")
-        if update_symlink:
-            create_symlink(install_path, symlink_path, dry_run)
-        else:
-            print(f"  Symlink not updated (still points to {current_symlink_target})")
-        return
+    # Check if existing installation needs rebuild due to missing configure flags
+    required_configure_flags = ["--with-icu", "--with-openssl"]
+    if with_llvm:
+        required_configure_flags.append("--with-llvm")
+    needs_rebuild = False
 
-    # Download and extract
-    url = f"https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.gz"
-    src_path = download_and_extract(url, SRC_DIR, dry_run)
+    if check_existing(install_path):
+        missing_flags = check_pg_needs_rebuild(install_path, required_configure_flags)
+        if missing_flags:
+            print(f"  Already installed: {install_path}")
+            print(f"  WARNING: Existing build is missing: {', '.join(missing_flags)}")
+            if not dry_run:
+                needs_rebuild = prompt_yes_no(
+                    f"  Rebuild PostgreSQL {version} with {', '.join(missing_flags)}?",
+                    default=True,
+                )
+            else:
+                needs_rebuild = True
+                print(f"  Would rebuild PostgreSQL {version} with {', '.join(missing_flags)}")
+            if not needs_rebuild:
+                print(f"  Skipping rebuild")
+                if update_symlink:
+                    create_symlink(install_path, symlink_path, dry_run)
+                return
+        else:
+            print(f"  Already installed: {install_path}")
+            if update_symlink:
+                create_symlink(install_path, symlink_path, dry_run)
+            else:
+                print(f"  Symlink not updated (still points to {current_symlink_target})")
+            return
+
+    # Download and extract (or reuse existing source for rebuild)
+    src_path = SRC_DIR / f"postgresql-{version}"
+    if needs_rebuild and src_path.is_dir():
+        print(f"  Reusing existing source tree: {src_path}")
+    else:
+        url = f"https://ftp.postgresql.org/pub/source/v{version}/postgresql-{version}.tar.gz"
+        src_path = download_and_extract(url, SRC_DIR, dry_run)
 
     if dry_run:
         src_path = SRC_DIR / f"postgresql-{version}"
@@ -896,11 +1038,19 @@ def build_postgresql(
     # Build configure command
     plat = get_platform()
     icu_path = INSTALL_BASE / "icu"
+    openssl_path = INSTALL_BASE / "openssl"
+
+    # Determine OpenSSL lib directory (3.x uses lib64 on some platforms)
+    openssl_lib_dir = openssl_path / "lib64"
+    if not openssl_lib_dir.exists():
+        openssl_lib_dir = openssl_path / "lib"
+    print(f"  OpenSSL path: {openssl_path} (lib: {openssl_lib_dir.name})")
 
     configure_cmd = [
         "./configure",
         f"--prefix={install_path}",
         "--with-icu",
+        "--with-openssl",
     ]
 
     # ICU flags
@@ -908,36 +1058,60 @@ def build_postgresql(
     env["ICU_CFLAGS"] = f"-I{icu_path}/include"
     env["ICU_LIBS"] = f"-L{icu_path}/lib -licui18n -licuuc -licudata"
 
-    # Set rpath so binaries can find ICU libraries at runtime
+    # Set rpath so binaries can find ICU and OpenSSL libraries at runtime
     if plat == "darwin":
-        env["LDFLAGS"] = f"-L{icu_path}/lib -Wl,-rpath,{icu_path}/lib"
+        env["LDFLAGS"] = (
+            f"-L{icu_path}/lib -Wl,-rpath,{icu_path}/lib "
+            f"-L{openssl_lib_dir} -Wl,-rpath,{openssl_lib_dir}"
+        )
     else:
-        env["LDFLAGS"] = f"-Wl,-rpath,{icu_path}/lib"
+        env["LDFLAGS"] = (
+            f"-Wl,-rpath,{icu_path}/lib "
+            f"-Wl,-rpath,{openssl_lib_dir}"
+        )
 
     # Platform-specific options
     if plat == "darwin":
         readline_path = INSTALL_BASE / "readline"
         configure_cmd.extend([
             "--with-bonjour",
-            f"--with-libraries={readline_path}/lib",
-            f"--with-includes={readline_path}/include",
+            f"--with-libraries={readline_path}/lib:{openssl_lib_dir}",
+            f"--with-includes={readline_path}/include:{openssl_path}/include",
         ])
     else:
-        # Linux: readline should be from system packages
-        pass
-
-    # LLVM/JIT support
-    llvm_config = find_llvm_config()
-    if llvm_config:
-        print(f"  ✅ Found LLVM: {llvm_config}")
+        # Linux: readline from system packages; add OpenSSL paths
         configure_cmd.extend([
-            "--with-llvm",
-            f"LLVM_CONFIG={llvm_config}",
+            f"--with-libraries={openssl_lib_dir}",
+            f"--with-includes={openssl_path}/include",
         ])
+
+    # LLVM/JIT support (resolved by caller)
+    if with_llvm:
+        llvm_config = find_llvm_config()
+        if llvm_config:
+            print(f"  LLVM/JIT: enabled ({llvm_config})")
+            configure_cmd.extend([
+                "--with-llvm",
+                f"LLVM_CONFIG={llvm_config}",
+            ])
+        else:
+            # Caller should have validated this, but guard anyway
+            print("  WARNING: --with-llvm requested but LLVM not found, skipping")
     else:
-        print("  LLVM not found, building without JIT support")
+        print("  LLVM/JIT: disabled")
 
     if not dry_run:
+        # Clean stale objects when rebuilding with different configure flags
+        if needs_rebuild:
+            run_build_cmd(
+                ["make", "clean"],
+                cwd=src_path,
+                env=env,
+                dry_run=dry_run,
+                verbose=verbose,
+                description="Cleaning previous build...",
+            )
+
         # Configure
         run_build_cmd(
             configure_cmd,
@@ -968,6 +1142,8 @@ def build_postgresql(
             description="Installing PostgreSQL...",
         )
     else:
+        if needs_rebuild:
+            print("  Would run: make clean")
         print(f"  Would run: {' '.join(configure_cmd)}")
         print("  Would build and install PostgreSQL")
 
@@ -1248,8 +1424,8 @@ _{script_name.replace("-", "_").replace(".", "_")}_completions() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--config --dry-run --component --skip-extensions --exclude-ast --verbose --completions --help"
-    components="readline icu postgresql contrib q3c ast pgast"
+    opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --verbose --completions --help"
+    components="readline openssl icu postgresql contrib q3c ast pgast"
 
     case "${{prev}}" in
         --config)
@@ -1289,9 +1465,10 @@ _pginstall() {{
     opts=(
         '--config[Config file for version pinning]:file:_files'
         '--dry-run[Show what would be done without executing]'
-        '--component[Build only specific component]:component:(readline icu postgresql contrib q3c ast pgast)'
+        '--component[Build only specific component]:component:(readline openssl icu postgresql contrib q3c ast pgast)'
         '--skip-extensions[Skip q3c, ast, and pgast extensions]'
         '--exclude-ast[Exclude Starlink AST library and pgast]'
+        '--with-llvm[Enable LLVM/JIT support (opt-in on macOS, auto on Linux)]'
         '--verbose[Show all build output]'
         '--completions[Output shell completion script]:shell:(bash zsh)'
         '--help[Show help message]'
@@ -1316,12 +1493,14 @@ Examples:
   %(prog)s --component icu     # Build only ICU
   %(prog)s --skip-extensions   # Skip q3c, ast, and pgast
   %(prog)s --exclude-ast       # Skip Starlink AST library and pgast
+  %(prog)s --with-llvm         # Enable LLVM/JIT support (required on macOS)
 
 Components:
   readline     GNU readline (macOS only)
+  openssl      OpenSSL cryptographic library
   icu          ICU - International Components for Unicode
   postgresql   PostgreSQL database server
-  contrib      Contrib extensions (citext, cube, earthdistance, pg_trgm)
+  contrib      Contrib extensions (citext, cube, earthdistance, pgcrypto, pg_trgm)
   q3c          Q3C spatial indexing extension
   ast          Starlink AST library (required by pgast)
   pgast        pgast extension (requires ast)
@@ -1348,7 +1527,7 @@ Shell completions:
     )
     parser.add_argument(
         "--component",
-        choices=["readline", "icu", "postgresql", "contrib", "q3c", "ast", "pgast"],
+        choices=["readline", "openssl", "icu", "postgresql", "contrib", "q3c", "ast", "pgast"],
         help="Build only specific component",
     )
     parser.add_argument(
@@ -1360,6 +1539,11 @@ Shell completions:
         "--exclude-ast",
         action="store_true",
         help="Exclude Starlink AST library and pgast extension",
+    )
+    parser.add_argument(
+        "--with-llvm",
+        action="store_true",
+        help="Enable LLVM/JIT support (opt-in on macOS, auto-detected on Linux)",
     )
     parser.add_argument(
         "--verbose",
@@ -1660,6 +1844,7 @@ def main() -> None:
     print("\nBuild plan:")
     if plat == "darwin":
         print(f"  readline:   {versions.get('readline', 'N/A')}")
+    print(f"  OpenSSL:    {versions['openssl']}")
     print(f"  ICU:        {versions['icu']}")
     print(f"  PostgreSQL: {versions['postgresql']}")
     print(f"  q3c:        {versions['q3c']}")
@@ -1670,6 +1855,54 @@ def main() -> None:
         print(f"  AST:        (excluded)")
         print(f"  pgast:      (excluded)")
 
+    # Resolve LLVM/JIT support (only when building PostgreSQL)
+    building_pg = (args.component is None or args.component == "postgresql")
+    use_llvm = False
+    if building_pg:
+        llvm_config = find_llvm_config()
+        if plat == "darwin":
+            # macOS: opt-in only via --with-llvm flag
+            if args.with_llvm:
+                if llvm_config:
+                    use_llvm = True
+                else:
+                    print("\n  --with-llvm specified but LLVM was not found.", file=sys.stderr)
+                    print("  Install via Homebrew: brew install llvm", file=sys.stderr)
+                    if not args.dry_run:
+                        sys.exit(1)
+        else:
+            # Linux: auto-detect, prompt if not found
+            if llvm_config:
+                use_llvm = True
+            elif args.with_llvm:
+                # Explicitly requested but not found
+                install_cmd = get_llvm_install_command()
+                if install_cmd:
+                    print(f"\n  --with-llvm specified but LLVM development packages are not installed.")
+                    print(f"  Run the following command, then re-run this script:")
+                    print(f"    {install_cmd}")
+                else:
+                    print(f"\n  --with-llvm specified but LLVM not found and package manager not detected.",
+                          file=sys.stderr)
+                if not args.dry_run:
+                    sys.exit(1)
+            else:
+                # Not found, not explicitly requested — prompt on Linux
+                install_cmd = get_llvm_install_command()
+                if install_cmd:
+                    if not args.dry_run:
+                        want_llvm = prompt_yes_no(
+                            "\n  LLVM not found. Install LLVM development packages for JIT support?",
+                            default=True,
+                        )
+                        if want_llvm:
+                            print(f"\n  Run the following command, then re-run this script:")
+                            print(f"    {install_cmd}")
+                            sys.exit(0)
+                        # User said no, continue without LLVM
+                    else:
+                        print(f"  LLVM not found. To install: {install_cmd}")
+
     # Build components
     if args.component:
         # Build only specified component
@@ -1678,10 +1911,12 @@ def main() -> None:
                 build_readline(versions["readline"], args.dry_run, args.verbose)
             else:
                 print("readline is only built from source on macOS")
+        elif args.component == "openssl":
+            build_openssl(versions["openssl"], args.dry_run, args.verbose)
         elif args.component == "icu":
             build_icu(versions["icu"], args.dry_run, args.verbose)
         elif args.component == "postgresql":
-            build_postgresql(versions["postgresql"], args.dry_run, args.verbose)
+            build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm)
         elif args.component == "contrib":
             build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
         elif args.component == "q3c":
@@ -1701,8 +1936,9 @@ def main() -> None:
         if plat == "darwin":
             build_readline(versions["readline"], args.dry_run, args.verbose)
 
+        build_openssl(versions["openssl"], args.dry_run, args.verbose)
         build_icu(versions["icu"], args.dry_run, args.verbose)
-        build_postgresql(versions["postgresql"], args.dry_run, args.verbose)
+        build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm)
         build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
 
         if not args.skip_extensions:
@@ -1716,13 +1952,6 @@ def main() -> None:
     print(f"{'=' * 60}")
     print(f"\nPostgreSQL is available at: {INSTALL_BASE / 'postgresql'}")
     print(f"Add to your PATH: export PATH={INSTALL_BASE / 'postgresql' / 'bin'}:$PATH")
-
-    # Show LLVM install hint on Linux if not found
-    if args.dry_run and plat == "linux" and not find_llvm_config():
-        llvm_cmd = get_llvm_install_command()
-        if llvm_cmd:
-            print(f"\nTo enable JIT support, install LLVM development packages:")
-            print(f"  {llvm_cmd}")
 
 
 if __name__ == "__main__":

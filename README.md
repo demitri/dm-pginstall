@@ -33,6 +33,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 | Component | Description | Install Path |
 |-----------|-------------|--------------|
 | ICU | International Components for Unicode | `/usr/local/icu-x.y` |
+| OpenSSL | Cryptographic library (required by pgcrypto) | `/usr/local/openssl-x.y.z` |
 | PostgreSQL | PostgreSQL database server | `/usr/local/postgresql-x.y` |
 | readline | GNU Readline (macOS only) | `/usr/local/readline-x.y` |
 
@@ -43,6 +44,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 | citext | Case-insensitive text type | PostgreSQL contrib |
 | cube | Multi-dimensional cube data type | PostgreSQL contrib |
 | earthdistance | Great circle distance calculations | PostgreSQL contrib |
+| pgcrypto | Cryptographic functions | PostgreSQL contrib |
 | pg_trgm | Trigram text similarity | PostgreSQL contrib |
 | q3c | Spatial indexing for astronomy | [segasai/q3c](https://github.com/segasai/q3c) |
 | AST | Starlink AST library (WCS handling) | [Starlink/ast](https://github.com/Starlink/ast) |
@@ -107,7 +109,7 @@ Options:
   -h, --help          Show help message
 ```
 
-**Components:** `readline`, `icu`, `postgresql`, `contrib`, `q3c`, `ast`, `pgast`
+**Components:** `readline`, `openssl`, `icu`, `postgresql`, `contrib`, `q3c`, `ast`, `pgast`
 
 #### Examples
 
@@ -308,6 +310,7 @@ Pin specific versions instead of auto-detecting latest:
 # pginstall.conf
 [versions]
 postgresql = 17.2
+openssl = 3.6.1
 icu = 76.1
 readline = 8.2
 q3c = 2.0.1
@@ -325,21 +328,25 @@ Components are built in dependency order:
 1. readline (macOS only)
    └── Required by PostgreSQL for command-line editing
 
-2. ICU
+2. OpenSSL
+   └── Required by PostgreSQL for pgcrypto and SSL support
+
+3. ICU
    └── Required by PostgreSQL for Unicode collation
    └── Automatically fixes library rpaths after install
 
-3. PostgreSQL
-   └── Links against ICU and readline
+4. PostgreSQL
+   └── Links against ICU, OpenSSL, and readline
    └── Enables JIT if LLVM is detected
 
-4. Contrib Extensions (from PostgreSQL source)
+5. Contrib Extensions (from PostgreSQL source)
    ├── citext
    ├── cube
    ├── earthdistance
+   ├── pgcrypto
    └── pg_trgm
 
-5. External Extensions
+6. External Extensions
    ├── q3c
    ├── Starlink AST library
    └── pgast (requires AST)
@@ -433,6 +440,7 @@ psql -d postgres
 CREATE EXTENSION citext;
 CREATE EXTENSION cube;
 CREATE EXTENSION earthdistance;
+CREATE EXTENSION pgcrypto;
 CREATE EXTENSION pg_trgm;
 
 -- Test external extensions
@@ -557,6 +565,7 @@ The installer auto-detects latest versions from:
 | Component | Source |
 |-----------|--------|
 | ICU | GitHub API: unicode-org/icu releases |
+| OpenSSL | GitHub API: openssl/openssl releases |
 | PostgreSQL | PostgreSQL FTP directory listing |
 | readline | GNU FTP directory listing |
 | q3c | GitHub API: segasai/q3c releases |
