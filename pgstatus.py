@@ -30,6 +30,7 @@ import platform
 import re
 import subprocess
 import sys
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -68,6 +69,8 @@ class PostgreSQLInstance:
     data_directory: Optional[Path] = None
     port: Optional[int] = None
     version: Optional[str] = None
+    server_version: Optional[str] = None
+    latest_version: Optional[str] = None
     service_type: ServiceType = ServiceType.UNKNOWN
     service_name: Optional[str] = None
     config_file: Optional[Path] = None
@@ -553,12 +556,57 @@ def find_pg_ctl() -> Optional[Path]:
 
 
 def read_pg_version(data_dir: Path) -> Optional[str]:
-    """Read PostgreSQL version from PG_VERSION file."""
+    """Read PostgreSQL major version from PG_VERSION file."""
     version_file = data_dir / "PG_VERSION"
     try:
         if version_file.exists():
             return version_file.read_text().strip()
     except (OSError, IOError, PermissionError):
+        pass
+    return None
+
+
+def get_server_version(pg_ctl_path: Optional[Path]) -> Optional[str]:
+    """
+    Get the full PostgreSQL server version (e.g. '18.2') from the postgres binary
+    located alongside pg_ctl.
+    """
+    if not pg_ctl_path:
+        return None
+
+    postgres_bin = pg_ctl_path.parent / "postgres"
+    if not postgres_bin.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            [str(postgres_bin), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            # Output: "postgres (PostgreSQL) 18.2"
+            match = re.search(r"(\d+\.\d+)", result.stdout)
+            if match:
+                return match.group(1)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def get_latest_postgresql_version() -> Optional[str]:
+    """Fetch the latest PostgreSQL version from the FTP listing."""
+    url = "https://ftp.postgresql.org/pub/source/"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pgstatus/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html = response.read().decode()
+        versions = re.findall(r'href="v(\d+\.\d+)/"', html)
+        if versions:
+            versions.sort(key=lambda v: tuple(map(int, v.split("."))), reverse=True)
+            return versions[0]
+    except Exception:
         pass
     return None
 
@@ -1117,6 +1165,7 @@ def discover_disabled_systemd_instances(
 
 def discover_all_instances(
     extra_paths: Optional[list[Path]] = None,
+    check_latest: bool = False,
 ) -> list[PostgreSQLInstance]:
     """Discover all PostgreSQL instances on the system."""
     instances = []
@@ -1136,6 +1185,29 @@ def discover_all_instances(
 
     # Dormant discovery: filesystem + log breadcrumb scan as final catch-all
     instances.extend(discover_dormant_instances(instances, extra_paths=extra_paths))
+
+    # Enrich instances with full server version from the postgres binary.
+    # Group by pg_ctl_path to avoid running postgres --version multiple times
+    # for the same binary.
+    version_cache: dict[str, Optional[str]] = {}
+    for inst in instances:
+        if inst.pg_ctl_path:
+            key = str(inst.pg_ctl_path)
+            if key not in version_cache:
+                version_cache[key] = get_server_version(inst.pg_ctl_path)
+            sv = version_cache[key]
+            if sv:
+                # Only set server_version if the major version matches the
+                # data directory's PG_VERSION (otherwise it's a mismatch).
+                if inst.version is None or sv.startswith(inst.version.split(".")[0]):
+                    inst.server_version = sv
+
+    # Fetch latest available version if requested
+    if check_latest:
+        latest = get_latest_postgresql_version()
+        if latest:
+            for inst in instances:
+                inst.latest_version = latest
 
     # Sort: running first, then stopped, then dormant, then unknown;
     # alphabetical within each group
@@ -1293,11 +1365,23 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     rows = []
 
     for inst in instances:
+        # Show full server version (e.g. "18.2") if available, otherwise
+        # fall back to the major version from PG_VERSION.
+        version_str = inst.server_version or inst.version or "-"
+        if inst.latest_version and inst.server_version:
+            try:
+                current = tuple(map(int, inst.server_version.split(".")))
+                latest = tuple(map(int, inst.latest_version.split(".")))
+                if latest > current:
+                    version_str += f" ({inst.latest_version} available)"
+            except ValueError:
+                pass
+
         rows.append([
             inst.name,
             inst.status.value,
             str(inst.port) if inst.port else "-",
-            inst.version or "-",
+            version_str,
             service_type_label(inst.service_type),
             str(inst.data_directory) if inst.data_directory else "-",
         ])
@@ -1370,7 +1454,16 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
 
         # Configuration
         lines.append(f"    Port:        {inst.port or '-'}")
-        lines.append(f"    Version:     {inst.version or '-'}")
+        version_display = inst.server_version or inst.version or "-"
+        lines.append(f"    Version:     {version_display}")
+        if inst.latest_version and inst.server_version:
+            try:
+                current = tuple(map(int, inst.server_version.split(".")))
+                latest = tuple(map(int, inst.latest_version.split(".")))
+                if latest > current:
+                    lines.append(f"    Upgrade:     {inst.latest_version} available")
+            except ValueError:
+                pass
         lines.append(f"    Service:     {inst.service_type.value}")
 
         # Paths
@@ -1429,7 +1522,16 @@ def format_info(instance: PostgreSQLInstance) -> str:
     # Configuration section
     lines.append("Configuration:")
     lines.append(f"  Port:        {instance.port or '-'}")
-    lines.append(f"  Version:     {instance.version or '-'}")
+    version_display = instance.server_version or instance.version or "-"
+    lines.append(f"  Version:     {version_display}")
+    if instance.latest_version and instance.server_version:
+        try:
+            current = tuple(map(int, instance.server_version.split(".")))
+            latest = tuple(map(int, instance.latest_version.split(".")))
+            if latest > current:
+                lines.append(f"  Upgrade:     {instance.latest_version} available")
+        except ValueError:
+            pass
     lines.append(f"  Data Dir:    {instance.data_directory or '-'}")
     lines.append("")
 
@@ -1666,7 +1768,8 @@ def main() -> int:
 
     # Discover instances
     extra_paths = [Path(p) for p in args.pgdata] if args.pgdata else None
-    instances = discover_all_instances(extra_paths=extra_paths)
+    check_latest = args.command in ("list", "info")
+    instances = discover_all_instances(extra_paths=extra_paths, check_latest=check_latest)
 
     # Handle commands
     if args.command == "list":
