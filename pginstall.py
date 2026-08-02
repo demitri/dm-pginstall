@@ -663,7 +663,7 @@ def load_versions(config_path: Optional[Path], exclude_ast: bool = False) -> dic
     print("\nDetecting versions...")
     if plat == "darwin":
         versions["readline"] = get_latest_readline_version()
-    versions["openssl"] = get_latest_openssl_version()
+        versions["openssl"] = get_latest_openssl_version()
     versions["icu"] = get_latest_icu_version()
     versions["postgresql"] = get_latest_postgresql_version()
     versions["q3c"] = get_latest_q3c_version()
@@ -1045,13 +1045,6 @@ def build_postgresql(
     # Build configure command
     plat = get_platform()
     icu_path = INSTALL_BASE / "icu"
-    openssl_path = INSTALL_BASE / "openssl"
-
-    # Determine OpenSSL lib directory (3.x uses lib64 on some platforms)
-    openssl_lib_dir = openssl_path / "lib64"
-    if not openssl_lib_dir.exists():
-        openssl_lib_dir = openssl_path / "lib"
-    print(f"  OpenSSL path: {openssl_path} (lib: {openssl_lib_dir.name})")
 
     configure_cmd = [
         "./configure",
@@ -1065,20 +1058,23 @@ def build_postgresql(
     env["ICU_CFLAGS"] = f"-I{icu_path}/include"
     env["ICU_LIBS"] = f"-L{icu_path}/lib -licui18n -licuuc -licudata"
 
-    # Set rpath so binaries can find ICU and OpenSSL libraries at runtime
+    # Platform-specific options
     if plat == "darwin":
+        # macOS: OpenSSL and readline are custom source builds under /usr/local
+        openssl_path = INSTALL_BASE / "openssl"
+
+        # Determine OpenSSL lib directory (3.x uses lib64 on some platforms)
+        openssl_lib_dir = openssl_path / "lib64"
+        if not openssl_lib_dir.exists():
+            openssl_lib_dir = openssl_path / "lib"
+        print(f"  OpenSSL path: {openssl_path} (lib: {openssl_lib_dir.name})")
+
+        # Set rpath so binaries can find ICU and OpenSSL libraries at runtime
         env["LDFLAGS"] = (
             f"-L{icu_path}/lib -Wl,-rpath,{icu_path}/lib "
             f"-L{openssl_lib_dir} -Wl,-rpath,{openssl_lib_dir}"
         )
-    else:
-        env["LDFLAGS"] = (
-            f"-Wl,-rpath,{icu_path}/lib "
-            f"-Wl,-rpath,{openssl_lib_dir}"
-        )
 
-    # Platform-specific options
-    if plat == "darwin":
         readline_path = INSTALL_BASE / "readline"
         configure_cmd.extend([
             "--with-bonjour",
@@ -1086,11 +1082,11 @@ def build_postgresql(
             f"--with-includes={readline_path}/include:{openssl_path}/include",
         ])
     else:
-        # Linux: readline from system packages; add OpenSSL paths
-        configure_cmd.extend([
-            f"--with-libraries={openssl_lib_dir}",
-            f"--with-includes={openssl_path}/include",
-        ])
+        # Linux: readline and OpenSSL come from system packages
+        # (libreadline-dev, libssl-dev) — configure finds them via pkg-config
+        # and standard system paths, no --with-libraries/--with-includes needed.
+        print("  OpenSSL: system package (libssl-dev)")
+        env["LDFLAGS"] = f"-Wl,-rpath,{icu_path}/lib"
 
     # LLVM/JIT support (resolved by caller)
     if with_llvm:
@@ -1508,7 +1504,7 @@ Examples:
 
 Components:
   readline     GNU readline (macOS only)
-  openssl      OpenSSL cryptographic library
+  openssl      OpenSSL cryptographic library (macOS only; Linux uses system libssl-dev)
   icu          ICU - International Components for Unicode
   postgresql   PostgreSQL database server
   contrib      Contrib extensions (citext, cube, earthdistance, pgcrypto, pg_trgm)
@@ -1668,6 +1664,14 @@ def check_missing_libraries() -> list[str]:
     if not any(p.exists() for p in zlib_paths):
         missing.append("zlib1g-dev")
 
+    # Check for OpenSSL development headers (Postgres links the system OpenSSL on Linux)
+    openssl_paths = [
+        Path("/usr/include/openssl/ssl.h"),
+        Path("/usr/local/include/openssl/ssl.h"),
+    ]
+    if not any(p.exists() for p in openssl_paths):
+        missing.append("libssl-dev")
+
     return missing
 
 
@@ -1686,6 +1690,7 @@ def get_package_names_for_tools(tools: list[str], pkg_mgr: str) -> list[str]:
         "gfortran": {"apt": "gfortran", "dnf": "gcc-gfortran", "yum": "gcc-gfortran", "pacman": "gcc-fortran"},
         "libreadline-dev": {"apt": "libreadline-dev", "dnf": "readline-devel", "yum": "readline-devel", "pacman": "readline"},
         "zlib1g-dev": {"apt": "zlib1g-dev", "dnf": "zlib-devel", "yum": "zlib-devel", "pacman": "zlib"},
+        "libssl-dev": {"apt": "libssl-dev", "dnf": "openssl-devel", "yum": "openssl-devel", "pacman": "openssl"},
     }
 
     # For apt, build-essential provides make and gcc
@@ -1860,7 +1865,9 @@ def main() -> None:
     print("\nBuild plan:")
     if plat == "darwin":
         print(f"  readline:   {versions.get('readline', 'N/A')}")
-    print(f"  OpenSSL:    {versions['openssl']}")
+        print(f"  OpenSSL:    {versions['openssl']}")
+    else:
+        print(f"  OpenSSL:    (system package)")
     print(f"  ICU:        {versions['icu']}")
     print(f"  PostgreSQL: {versions['postgresql']}")
     print(f"  q3c:        {versions['q3c']}")
@@ -1929,7 +1936,10 @@ def main() -> None:
             else:
                 print("readline is only built from source on macOS")
         elif args.component == "openssl":
-            build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
+            if plat == "darwin":
+                build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
+            else:
+                print("openssl is only built from source on macOS; Linux uses the system package (libssl-dev)")
         elif args.component == "icu":
             build_icu(versions["icu"], args.dry_run, args.verbose, no_alias=na)
         elif args.component == "postgresql":
@@ -1952,8 +1962,8 @@ def main() -> None:
         # Build everything in order
         if plat == "darwin":
             build_readline(versions["readline"], args.dry_run, args.verbose, no_alias=na)
+            build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
 
-        build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
         build_icu(versions["icu"], args.dry_run, args.verbose, no_alias=na)
         build_postgresql(versions["postgresql"], args.dry_run, args.verbose, with_llvm=use_llvm, no_alias=na)
         build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)

@@ -7,9 +7,9 @@
 
 [versions]
 # postgresql = 17.2
-# openssl = 3.6.1
+# openssl = 3.6.1    # macOS only; ignored on Linux (system libssl-dev is used)
 # icu = 76.1
-# readline = 8.2
+# readline = 8.2     # macOS only; ignored on Linux (system libreadline-dev is used)
 # q3c = 2.0.1
 # ast = 9.3.0
 # pgast = main
