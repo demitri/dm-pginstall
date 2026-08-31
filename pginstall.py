@@ -902,6 +902,11 @@ def load_versions(config_path: Optional[Path], exclude_ast: bool = False,
     # a q3c release query.
     if component in COMPONENT_VERSIONS:
         wanted = set(COMPONENT_VERSIONS[component])
+        # --build-llvm links PostgreSQL against the private toolchain, so a
+        # PostgreSQL-only run still has to resolve the LLVM version in order to
+        # locate it. Trimming that away crashed the run outright.
+        if build_llvm and component in ("postgresql", "llvm"):
+            wanted.add("llvm")
         detectors = {k: v for k, v in detectors.items() if k in wanted}
 
     pinned: dict[str, str] = {}
@@ -1228,9 +1233,18 @@ def llvm_install_is_complete(install_path: Path) -> bool:
         path = install_path / "bin" / binary
         if not (path.is_file() and os.access(path, os.X_OK)):
             return False
-    libdir = install_path / "lib"
     # llvmjit.so links the shared runtime; a static-only tree is unusable here.
-    return any(libdir.glob("libLLVM*.so*")) or any(libdir.glob("libLLVM*.dylib"))
+    # A glob match alone is not enough: it also matches directories and dangling
+    # symlinks from an interrupted install. libLLVM-C is the C API wrapper, not
+    # the library PostgreSQL links, so it does not count either.
+    libdir = install_path / "lib"
+    for candidate in list(libdir.glob("libLLVM*.so*")) + list(
+            libdir.glob("libLLVM*.dylib")):
+        if candidate.name.startswith("libLLVM-C"):
+            continue
+        if candidate.is_file():      # follows symlinks; a dangling one is False
+            return True
+    return False
 
 
 def build_llvm(

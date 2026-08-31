@@ -313,6 +313,57 @@ def test_component_build_does_not_query_unrelated_upstreams():
             setattr(p, name, fn)
 
 
+def test_postgresql_component_with_build_llvm_resolves_the_llvm_version():
+    """Regression: trimming version discovery to the selected component removed
+    the LLVM version that '--component postgresql --build-llvm' needs to locate
+    the private toolchain, crashing the run with KeyError: 'llvm'."""
+    saved = {}
+    for name in ("get_latest_openssl_version", "get_latest_icu_version",
+                 "get_latest_q3c_version", "get_latest_ast_version",
+                 "get_latest_pgast_version"):
+        saved[name] = getattr(p, name)
+        setattr(p, name, lambda: (_ for _ in ()).throw(
+            AssertionError("unrelated upstream queried")))
+    saved["get_latest_postgresql_version"] = p.get_latest_postgresql_version
+    saved["get_latest_llvm_version"] = p.get_latest_llvm_version
+    p.get_latest_postgresql_version = lambda: "18.6"
+    p.get_latest_llvm_version = lambda: "23.1.0"
+
+    try:
+        versions = p.load_versions(None, build_llvm=True, component="postgresql")
+        check("llvm version resolved", versions.get("llvm"), "23.1.0")
+        check("postgresql version resolved", versions.get("postgresql"), "18.6")
+        check("still no unrelated versions", sorted(versions),
+              ["llvm", "postgresql"])
+        # And without --build-llvm it must stay trimmed.
+        plain = p.load_versions(None, build_llvm=False, component="postgresql")
+        check("no llvm when not building it", sorted(plain), ["postgresql"])
+    finally:
+        for name, fn in saved.items():
+            setattr(p, name, fn)
+
+
+def test_shared_runtime_must_be_a_real_file():
+    """A glob match is not a usable library: an interrupted install can leave a
+    directory or a dangling symlink with a matching name."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+
+        as_dir = make_llvm_tree(base / "a", with_runtime=False)
+        (as_dir / "lib" / "libLLVM.so.23.1").mkdir()
+        check("directory is not a runtime", p.llvm_install_is_complete(as_dir), False)
+
+        dangling = make_llvm_tree(base / "b", with_runtime=False)
+        (dangling / "lib" / "libLLVM.so.23.1").symlink_to(base / "gone.so")
+        check("dangling symlink is not a runtime",
+              p.llvm_install_is_complete(dangling), False)
+
+        c_only = make_llvm_tree(base / "c", with_runtime=False)
+        (c_only / "lib" / "libLLVM-C.so").write_text("")
+        check("libLLVM-C alone does not count",
+              p.llvm_install_is_complete(c_only), False)
+
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
