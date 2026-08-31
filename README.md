@@ -44,6 +44,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 | citext | Case-insensitive text type | PostgreSQL contrib |
 | cube | Multi-dimensional cube data type | PostgreSQL contrib |
 | earthdistance | Great circle distance calculations | PostgreSQL contrib |
+| ltree | Hierarchical tree-like data type | PostgreSQL contrib |
 | pgcrypto | Cryptographic functions | PostgreSQL contrib |
 | pg_trgm | Trigram text similarity | PostgreSQL contrib |
 | q3c | Spatial indexing for astronomy | [segasai/q3c](https://github.com/segasai/q3c) |
@@ -343,6 +344,7 @@ Components are built in dependency order:
    ├── citext
    ├── cube
    ├── earthdistance
+   ├── ltree
    ├── pgcrypto
    └── pg_trgm
 
@@ -440,6 +442,7 @@ psql -d postgres
 CREATE EXTENSION citext;
 CREATE EXTENSION cube;
 CREATE EXTENSION earthdistance;
+CREATE EXTENSION ltree;
 CREATE EXTENSION pgcrypto;
 CREATE EXTENSION pg_trgm;
 

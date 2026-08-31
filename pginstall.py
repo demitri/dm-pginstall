@@ -44,7 +44,7 @@ GITHUB_API = "https://api.github.com"
 GFORTRAN_MACOS_RELEASES = "https://github.com/fxcoudert/gfortran-for-macOS/releases"
 
 # Contrib extensions to build
-CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "pgcrypto", "pg_trgm"]
+CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "ltree", "pgcrypto", "pg_trgm"]
 
 
 def get_platform() -> str:
@@ -1511,7 +1511,7 @@ Components:
   openssl      OpenSSL cryptographic library
   icu          ICU - International Components for Unicode
   postgresql   PostgreSQL database server
-  contrib      Contrib extensions (citext, cube, earthdistance, pgcrypto, pg_trgm)
+  contrib      Contrib extensions (citext, cube, earthdistance, ltree, pgcrypto, pg_trgm)
   q3c          Q3C spatial indexing extension
   ast          Starlink AST library (required by pgast)
   pgast        pgast extension (requires ast)
