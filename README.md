@@ -199,6 +199,59 @@ main      running  5432   17.2     /usr/local/postgresql/data/main
 dev       stopped  5433   17.2     /usr/local/postgresql/data/dev
 ```
 
+### pgjitguard.py (Linux only)
+
+Protects a JIT-enabled build against system LLVM upgrades.
+
+PostgreSQL built with `--with-llvm` produces `llvmjit.so`, which links against a
+specific versioned LLVM runtime (e.g. `libLLVM.so.20.1`). The package manager has
+no record of that dependency, so an ordinary system upgrade can retire the
+runtime. The failure is easy to miss: `llvmjit.so` is loaded lazily, so the
+server starts cleanly, `pg_isready` succeeds, and cheap queries work — only
+queries costing more than `jit_above_cost` fail.
+
+The tool reads `llvmjit.so`'s own `DT_NEEDED` entries, resolves them with `ldd`,
+and asks `dpkg` which packages own them. The dependency set is always derived
+from the built module, never hand-maintained.
+
+```bash
+# What does the JIT module depend on, and is anything protecting it?
+./pgjitguard.py status
+
+# Verify JIT still works, by running a query that forces JIT compilation
+./pgjitguard.py check --live
+
+# Enforce the dependency (prompts for the method)
+sudo ./pgjitguard.py protect
+
+# Run the check automatically after every apt transaction
+sudo ./pgjitguard.py install-hook
+```
+
+`protect` offers two enforcement methods:
+
+| Method | How it works | Trade-off |
+|--------|--------------|-----------|
+| `depends` (default) | Generates a small `.deb` whose `Depends:` are the owning packages | apt models the dependency properly: removal refused, breaking upgrades warn, autoremove can't reap it, security updates still apply |
+| `hold` | `apt-mark manual` + `hold` on the same packages | Nothing generated and reversible with `apt-mark`, but it also blocks security updates for those packages |
+
+`pginstall.py` offers to run `protect` after any JIT-enabled build.
+
+**After rebuilding PostgreSQL against a newer LLVM**, re-run `sudo ./pgjitguard.py
+protect`. Either method re-derives the dependency set from the rebuilt module,
+protects the new runtime, and releases the old one — `apt autoremove` then
+reclaims it. There is nothing to unpin by hand.
+
+Options:
+- `--pg-config PATH` - Use a specific `pg_config` (default: `/usr/local/postgresql/bin`, then PATH)
+- `-m`, `--method` - `depends` or `hold` (default: ask)
+- `--live` - `check` also runs a query that forces JIT compilation
+- `--hook` - `check` warns loudly but always exits 0 (used by the apt hook)
+- `--dry-run` - Show what would be done without executing
+
+`protect` refuses to run against a module whose dependencies are already
+unresolved — doing so would record the wrong set. Rebuild first, then protect.
+
 ### create_pg_service.py (Linux only)
 
 Creates systemd services to run PostgreSQL instances. Uses template units to support multiple instances running simultaneously. This script:
@@ -536,6 +589,36 @@ sudo apt install llvm-dev clang
 sudo dnf install llvm-devel clang
 ```
 
+### Expensive Queries Fail After a System Upgrade
+
+```
+ERROR:  could not load library "/usr/local/postgresql/lib/llvmjit.so":
+        libLLVM.so.20.1: cannot open shared object file: No such file or directory
+```
+
+A system upgrade replaced the LLVM that `llvmjit.so` was built against. Because
+the JIT module is loaded lazily, the server starts normally and cheap queries
+still succeed — only queries above `jit_above_cost` fail, which can go unnoticed
+for a long time.
+
+Confirm and fix:
+
+```bash
+# Confirm: shows exactly which dependency no longer resolves
+./pgjitguard.py status
+
+# Fix: rebuild the JIT module against the currently installed LLVM
+./pginstall.py --component postgresql --with-llvm
+
+# Then stop it happening again
+sudo ./pgjitguard.py protect
+```
+
+See [pgjitguard.py](#pgjitguardpy-linux-only) for how the protection works. As an
+immediate workaround, `jit = off` in `postgresql.conf` avoids the failure without
+a rebuild — and is worth benchmarking regardless, since JIT is not a win for
+every workload.
+
 ### patchelf Not Found (with sudo)
 
 If you see `sudo: patchelf: command not found`, install the system patchelf:
@@ -585,6 +668,7 @@ The installer auto-detects latest versions from:
 | `create_pg_service.py` | Systemd service setup (Linux only) |
 | `create_pg_service_macos.py` | Launchd service setup (macOS only) |
 | `pgstatus.py` | Instance manager (list, info, start/stop/restart) |
+| `pgjitguard.py` | Protects the JIT module's LLVM dependency from system upgrades (Linux) |
 | `add_rpaths_to_dylibs.py` | Rpath fixer for shared libraries |
 | `test_install.sh` | Post-installation verification script |
 | `pginstall.conf.example` | Example configuration file |

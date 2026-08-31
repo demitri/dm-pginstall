@@ -212,18 +212,38 @@ def get_extension_make_args(pg_config: Path) -> list[str]:
 
 
 def find_llvm_config() -> Optional[str]:
-    """Locate llvm-config binary, return path or None."""
-    # Common locations to check
-    candidates = [
-        "/usr/bin/llvm-config",
-        "/opt/homebrew/opt/llvm/bin/llvm-config",  # macOS Homebrew (Apple Silicon)
-        "/usr/local/opt/llvm/bin/llvm-config",  # macOS Homebrew (Intel)
-    ]
+    """Locate llvm-config binary, return path or None.
 
-    # Linux: check /usr/lib/llvm-*/bin/llvm-config
+    On Linux, /usr/bin/llvm-config belongs to the unversioned llvm-dev
+    metapackage and follows whatever LLVM the distribution currently treats as
+    default. Building against it bakes today's default into llvmjit.so, so a
+    later default bump can retire that runtime and break JIT silently — the
+    module loads lazily, so only queries above jit_above_cost fail. Prefer an
+    explicitly versioned toolchain, which moves only when we rebuild.
+    """
+    candidates: list[str] = []
+
     if get_platform() == "linux":
-        llvm_dirs = sorted(Path("/usr/lib").glob("llvm-*/bin/llvm-config"), reverse=True)
-        candidates.extend(str(p) for p in llvm_dirs)
+        # Versioned toolchains first, highest version wins. Compare as version
+        # tuples, not text: a lexical sort ranks llvm-9 above llvm-21, and
+        # handles dotted names (llvm-6.0) alongside plain ones (llvm-21).
+        versioned: list[tuple[tuple[int, ...], str]] = []
+        for libdir in ("/usr/lib", "/usr/lib64"):
+            for path in Path(libdir).glob("llvm-*/bin/llvm-config"):
+                match = re.match(r"^llvm-(\d+(?:\.\d+)*)$", path.parent.parent.name)
+                if match:
+                    version = tuple(int(p) for p in match.group(1).split("."))
+                    versioned.append((version, str(path)))
+        versioned.sort(key=lambda item: item[0], reverse=True)
+        candidates.extend(path for _, path in versioned)
+        # Unversioned metapackage symlink only as a fallback.
+        candidates.append("/usr/bin/llvm-config")
+    else:
+        candidates.extend([
+            "/usr/bin/llvm-config",
+            "/opt/homebrew/opt/llvm/bin/llvm-config",  # macOS Homebrew (Apple Silicon)
+            "/usr/local/opt/llvm/bin/llvm-config",  # macOS Homebrew (Intel)
+        ])
 
     for candidate in candidates:
         if Path(candidate).is_file() and os.access(candidate, os.X_OK):
@@ -235,6 +255,19 @@ def find_llvm_config() -> Optional[str]:
         return result
 
     return None
+
+
+def get_llvm_version(llvm_config: str) -> Optional[str]:
+    """Return the version reported by an llvm-config, or None if it fails."""
+    try:
+        result = subprocess.run(
+            [llvm_config, "--version"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 def detect_package_manager() -> Optional[str]:
@@ -262,6 +295,66 @@ def get_llvm_install_command() -> Optional[str]:
     elif pkg_mgr == "pacman":
         return "sudo pacman -S llvm clang"
     return None
+
+
+def offer_jit_protection(dry_run: bool) -> None:
+    """After a JIT-enabled build, offer to make the LLVM dependency visible to apt.
+
+    llvmjit.so links against a specific versioned LLVM runtime that the package
+    manager has no record of. Left undeclared, a routine upgrade can retire that
+    runtime: the server still starts and cheap queries still work, so the
+    breakage only surfaces when a query crosses jit_above_cost. pgjitguard.py
+    derives the dependency from the built module and enforces it.
+    """
+    if get_platform() != "linux":
+        return
+
+    print(f"\n{'=' * 60}")
+    print("JIT dependency protection")
+    print(f"{'=' * 60}")
+    print("\n  PostgreSQL was built with JIT support. llvmjit.so links against a")
+    print("  specific LLVM runtime that the package manager has no record of, so")
+    print("  a later LLVM upgrade can remove it. The server would still start and")
+    print("  cheap queries would still work; only queries above jit_above_cost")
+    print("  would fail.")
+
+    guard = SCRIPT_DIR / "pgjitguard.py"
+    if not guard.is_file():
+        print(f"\n  pgjitguard.py was not found next to this script ({SCRIPT_DIR}).")
+        print("  Restore it to protect the dependency automatically.")
+        return
+
+    if detect_package_manager() != "apt":
+        # The enforcement mechanisms are dpkg-specific; say so rather than
+        # leaving the impression that nothing needs doing.
+        print("\n  Automatic protection requires a dpkg-based system. On this")
+        print("  distribution, prevent the LLVM runtime from being removed using")
+        print("  your package manager's equivalent (e.g. 'dnf versionlock').")
+        print(f"\n  To inspect the dependency at any time:\n    {guard} status")
+        return
+
+    if dry_run:
+        print(f"\n  [dry-run] Would offer to run: sudo {guard} protect")
+        return
+
+    if not sys.stdin.isatty():
+        print("\n  Not running on a terminal, so skipping the prompt. To protect")
+        print(f"  the dependency, run:\n    sudo {guard} protect")
+        return
+
+    if not prompt_yes_no("\n  Protect this dependency now?", default=True):
+        print(f"\n  Skipped. To do it later, run:\n    sudo {guard} protect")
+        return
+
+    # pgjitguard prompts for the enforcement method itself.
+    result = subprocess.run(["sudo", str(guard), "protect"])
+    if result.returncode != 0:
+        print(f"\n  pgjitguard exited {result.returncode}; the dependency is NOT",
+              file=sys.stderr)
+        print(f"  protected. To retry:\n    sudo {guard} protect", file=sys.stderr)
+        return
+
+    print(f"\n  Re-run 'sudo {guard} protect' after any future PostgreSQL rebuild.")
 
 
 def check_existing(install_path: Path) -> bool:
@@ -1096,7 +1189,12 @@ def build_postgresql(
     if with_llvm:
         llvm_config = find_llvm_config()
         if llvm_config:
-            print(f"  LLVM/JIT: enabled ({llvm_config})")
+            # Record the exact toolchain in the build output: llvmjit.so will
+            # link against this LLVM's runtime, and that dependency is invisible
+            # to the package manager afterwards.
+            llvm_version = get_llvm_version(llvm_config)
+            version_note = f", version {llvm_version}" if llvm_version else ""
+            print(f"  LLVM/JIT: enabled ({llvm_config}{version_note})")
             configure_cmd.extend([
                 "--with-llvm",
                 f"LLVM_CONFIG={llvm_config}",
@@ -1969,6 +2067,9 @@ def main() -> None:
     print(f"{'=' * 60}")
     print(f"\nPostgreSQL is available at: {INSTALL_BASE / 'postgresql'}")
     print(f"Add to your PATH: export PATH={INSTALL_BASE / 'postgresql' / 'bin'}:$PATH")
+
+    if building_pg and use_llvm:
+        offer_jit_protection(args.dry_run)
 
 
 if __name__ == "__main__":
