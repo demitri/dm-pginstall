@@ -191,6 +191,7 @@ def make_llvm_tree(base, with_clang=True, with_runtime=True):
     (base / "bin" / "llvm-config").chmod(0o755)
     if with_clang:
         (base / "bin" / "clang").write_text("#!/bin/sh\n")
+        (base / "bin" / "clang").chmod(0o755)
     if with_runtime:
         (base / "lib" / "libLLVM.so.23.1").write_text("")
     return base
@@ -265,6 +266,51 @@ def test_pinned_versions_need_no_network():
         finally:
             for name, fn in saved.items():
                 setattr(p, name, fn)
+
+
+def test_non_executable_binaries_are_not_a_complete_install():
+    """A file is not a program. An interrupted install can leave a
+    non-executable stub that PostgreSQL cannot run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tree = make_llvm_tree(Path(tmp) / "llvm-23.1.0")
+        check("baseline is complete", p.llvm_install_is_complete(tree), True)
+
+        (tree / "bin" / "clang").chmod(0o644)
+        check("non-executable clang rejected",
+              p.llvm_install_is_complete(tree), False)
+
+        (tree / "bin" / "clang").chmod(0o755)
+        (tree / "bin" / "llvm-config").chmod(0o644)
+        check("non-executable llvm-config rejected",
+              p.llvm_install_is_complete(tree), False)
+
+
+def test_component_build_does_not_query_unrelated_upstreams():
+    """'--component llvm' must not fail because an unrelated upstream is
+    unreachable or rate-limiting."""
+    def explode(name):
+        def boom():
+            raise AssertionError(f"queried {name} for --component llvm")
+        return boom
+
+    saved = {}
+    for name in ("get_latest_openssl_version", "get_latest_icu_version",
+                 "get_latest_postgresql_version", "get_latest_q3c_version",
+                 "get_latest_ast_version", "get_latest_pgast_version"):
+        saved[name] = getattr(p, name)
+        setattr(p, name, explode(name))
+    saved["get_latest_llvm_version"] = p.get_latest_llvm_version
+    p.get_latest_llvm_version = lambda: "23.1.0"
+
+    try:
+        versions = p.load_versions(None, build_llvm=True, component="llvm")
+        check("only llvm resolved", sorted(versions), ["llvm"])
+        check("llvm version present", versions["llvm"], "23.1.0")
+    except AssertionError as exc:
+        check("no unrelated upstream queried", str(exc), "(none)")
+    finally:
+        for name, fn in saved.items():
+            setattr(p, name, fn)
 
 
 # ---------------------------------------------------------------------------

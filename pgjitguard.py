@@ -353,7 +353,9 @@ def next_pin_version() -> str:
 
 
 def build_pin_package(state: JitState, version: str, workdir: Path,
-                      packages: list[str]) -> Path:
+                      packages: list[str],
+                      contributors: Optional[list[tuple[Path, list[str]]]] = None,
+                      uninspectable: Optional[list[Path]] = None) -> Path:
     """Build the dependency .deb from the module's real dependencies."""
     dpkg_deb = require_tool("dpkg-deb", "dpkg")
 
@@ -374,7 +376,17 @@ def build_pin_package(state: JitState, version: str, workdir: Path,
         f"module:      {state.module}",
         f"depends:     {', '.join(packages)}",
         "",
-        "# Direct dependencies of llvmjit.so at the time of pinning:",
+        "# Installations this package protects. Its Depends are the union of",
+        "# their requirements, since one system-wide package name has to cover",
+        "# every side-by-side PostgreSQL version.",
+    ]
+    for path, packages_for in (contributors or []):
+        manifest.append(f"  {path}  ->  {', '.join(packages_for)}")
+    for path in (uninspectable or []):
+        manifest.append(f"  {path}  ->  (not inspectable; prior Depends kept)")
+    manifest += [
+        "",
+        "# Direct dependencies of llvmjit.so in the installation that was named:",
     ]
     for soname in state.needed:
         path = state.resolved.get(soname) or "NOT FOUND"
@@ -408,7 +420,9 @@ Description: Pin runtime libraries needed by a source-built PostgreSQL JIT
     return deb
 
 
-def apply_depends(state: JitState, dry_run: bool, packages: list[str]) -> int:
+def apply_depends(state: JitState, dry_run: bool, packages: list[str],
+                  contributors: Optional[list[tuple[Path, list[str]]]] = None,
+                  uninspectable: Optional[list[Path]] = None) -> int:
     """Install a generated package declaring the JIT dependencies to protect."""
     version = next_pin_version()
     current = installed_pin_version()
@@ -423,7 +437,8 @@ def apply_depends(state: JitState, dry_run: bool, packages: list[str]) -> int:
     require_root("protect")
 
     with tempfile.TemporaryDirectory(prefix="pgjitguard-") as tmp:
-        deb = build_pin_package(state, version, Path(tmp), packages)
+        deb = build_pin_package(state, version, Path(tmp), packages,
+                                contributors, uninspectable)
         print(f"\nInstalling {deb.name} ...")
         run(["dpkg", "-i", str(deb)])
 
@@ -509,10 +524,19 @@ def at_risk_installations(current: JitState) -> tuple[
 
 def union_pin_packages(current: JitState) -> tuple[
         list[str], list[tuple[Path, list[str]]], list[Path]]:
-    """The package set one system-wide pin must declare to cover every install."""
+    """The package set one system-wide pin must declare to cover every install.
+
+    When an installation cannot be inspected, whatever the existing pin already
+    declares is carried forward. Replacing the pin with only the packages we
+    could derive would drop the dependencies protecting that installation --
+    the exact silent unprotection this tool exists to prevent, and the opposite
+    of the conservative treatment uninspectable installs are promised.
+    """
     contributors, uninspectable = at_risk_installations(current)
-    packages = sorted({pkg for _, pkgs in contributors for pkg in pkgs})
-    return packages, contributors, uninspectable
+    packages = {pkg for _, pkgs in contributors for pkg in pkgs}
+    if uninspectable:
+        packages.update(installed_pin_depends())
+    return sorted(packages), contributors, uninspectable
 
 
 def remediation_command(state: JitState, action: str = "protect") -> str:
@@ -782,10 +806,12 @@ def cmd_protect(args: argparse.Namespace) -> int:
             for path, packages in contributors:
                 print(f"  {path}  ({', '.join(packages)})")
             for path in uninspectable:
-                print(f"  {path}  (could not inspect; leaving protection in place)")
+                print(f"  {path}  (could not inspect; keeping its existing"
+                      " dependencies)")
             print("\nRebuilding the pin to cover them:")
             print(f"Depends on:  {', '.join(required)}")
-            return apply_depends(state, args.dry_run, required)
+            return apply_depends(state, args.dry_run, required,
+                             contributors, uninspectable)
 
         if uninspectable:
             print("\nLeaving the pin alone: these installations could not be")
@@ -822,10 +848,12 @@ def cmd_protect(args: argparse.Namespace) -> int:
                 print(f"  {path}  ({', '.join(packages)})")
         print(f"Combined:    {', '.join(required)}")
     for path in uninspectable:
-        print(f"  WARNING: could not inspect {path}; its needs are not covered")
+        print(f"  WARNING: could not inspect {path}; carrying its existing"
+              " pin dependencies forward unchanged")
 
     print()
-    return apply_depends(state, args.dry_run, required)
+    return apply_depends(state, args.dry_run, required,
+                             contributors, uninspectable)
 
 
 def cmd_unprotect(args: argparse.Namespace) -> int:

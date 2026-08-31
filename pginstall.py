@@ -856,8 +856,24 @@ def get_latest_ast_version() -> str:
 # =============================================================================
 
 
+# Which versions each component actually needs resolved. contrib is built from
+# the PostgreSQL source tree, so it needs that version too.
+COMPONENT_VERSIONS = {
+    "readline": ["readline"],
+    "openssl": ["openssl"],
+    "icu": ["icu"],
+    "llvm": ["llvm"],
+    "postgresql": ["postgresql"],
+    "contrib": ["postgresql"],
+    "q3c": ["q3c"],
+    "ast": ["ast"],
+    "pgast": ["pgast"],
+}
+
+
 def load_versions(config_path: Optional[Path], exclude_ast: bool = False,
-                  build_llvm: bool = False) -> dict:
+                  build_llvm: bool = False,
+                  component: Optional[str] = None) -> dict:
     """Resolve component versions, preferring the config file over discovery.
 
     The config is read first and upstream is queried only for what it does not
@@ -880,6 +896,13 @@ def load_versions(config_path: Optional[Path], exclude_ast: bool = False,
     if not exclude_ast:
         detectors["ast"] = get_latest_ast_version
         detectors["pgast"] = get_latest_pgast_version
+
+    # Building one component must not depend on unrelated upstreams being
+    # reachable: '--component llvm' should not fail because GitHub rate-limited
+    # a q3c release query.
+    if component in COMPONENT_VERSIONS:
+        wanted = set(COMPONENT_VERSIONS[component])
+        detectors = {k: v for k, v in detectors.items() if k in wanted}
 
     pinned: dict[str, str] = {}
     if config_path and config_path.exists():
@@ -1199,10 +1222,12 @@ def llvm_install_is_complete(install_path: Path) -> bool:
     partway leaves one behind. Trusting it would make every retry a no-op and
     could alias a broken tree into /usr/local/llvm.
     """
-    if not (install_path / "bin" / "llvm-config").is_file():
-        return False
-    if not (install_path / "bin" / "clang").is_file():
-        return False
+    # Executable, not merely present: an interrupted install can leave a
+    # non-executable stub that PostgreSQL cannot actually run.
+    for binary in ("llvm-config", "clang"):
+        path = install_path / "bin" / binary
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            return False
     libdir = install_path / "lib"
     # llvmjit.so links the shared runtime; a static-only tree is unusable here.
     return any(libdir.glob("libLLVM*.so*")) or any(libdir.glob("libLLVM*.dylib"))
@@ -2351,23 +2376,22 @@ def main() -> None:
 
     # Load versions
     versions = load_versions(args.config, exclude_ast=args.exclude_ast,
-                             build_llvm=args.build_llvm)
+                             build_llvm=args.build_llvm,
+                             component=args.component)
 
     print("\nBuild plan:")
-    if plat == "darwin":
-        print(f"  readline:   {versions.get('readline', 'N/A')}")
-    print(f"  OpenSSL:    {versions['openssl']}")
-    print(f"  ICU:        {versions['icu']}")
-    if args.build_llvm:
-        print(f"  LLVM:       {versions['llvm']} (built from source)")
-    print(f"  PostgreSQL: {versions['postgresql']}")
-    print(f"  q3c:        {versions['q3c']}")
-    if not args.exclude_ast:
-        print(f"  AST:        {versions['ast']}")
-        print(f"  pgast:      {versions['pgast']}")
-    else:
-        print(f"  AST:        (excluded)")
-        print(f"  pgast:      (excluded)")
+    labels = [
+        ("readline", "readline"), ("openssl", "OpenSSL"), ("icu", "ICU"),
+        ("llvm", "LLVM"), ("postgresql", "PostgreSQL"), ("q3c", "q3c"),
+        ("ast", "AST"), ("pgast", "pgast"),
+    ]
+    for key, label in labels:
+        if key in versions:
+            note = " (built from source)" if key == "llvm" else ""
+            print(f"  {label + ':':<12}{versions[key]}{note}")
+    if args.exclude_ast and args.component is None:
+        print(f"  {'AST:':<12}(excluded)")
+        print(f"  {'pgast:':<12}(excluded)")
 
     # --build-llvm is a stronger form of --with-llvm: there is no reason to
     # build LLVM and then not link against it.

@@ -283,6 +283,43 @@ def test_uninspectable_sibling_blocks_pin_removal():
             restore()
 
 
+def test_uninspectable_sibling_keeps_its_dependencies_in_a_rebuilt_pin():
+    """The reported failure: with one known contributor AND one uninspectable
+    sibling, the pin was rebuilt from known packages only, dropping whatever
+    protected the sibling -- the opposite of the conservative treatment
+    uninspectable installs are promised."""
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        base = make_installs(Path(tmp), ["18.1", "18.3"])
+        current = FakeState(["libllvm21"],
+                            pg_config=str(base / "postgresql-18.6" / "bin" / "pg_config"))
+
+        broken = base / "postgresql-18.1" / "bin" / "pg_config"
+
+        class Known:
+            has_jit = True
+            is_at_risk = True
+            packages = ["libllvm21"]
+
+        def inspect(pg_config):
+            if Path(pg_config).resolve() == broken.resolve():
+                raise SystemExit(2)
+            return Known()
+
+        restore = stub(INSTALL_BASE=base, JitState=inspect,
+                       installed_pin_version=lambda: "1.4",
+                       # The existing pin protects the sibling we cannot inspect.
+                       installed_pin_depends=lambda: ["libllvm18", "libllvm21"])
+        try:
+            required, contributors, uninspectable = g.union_pin_packages(current)
+            check("uninspectable sibling reported", uninspectable, [broken])
+            check("known contributor still present", len(contributors), 2)
+            check("prior dependency carried forward", "libllvm18" in required, True)
+            check("union is complete", required, ["libllvm18", "libllvm21"])
+        finally:
+            restore()
+
+
 def test_private_sibling_does_not_block_pin_removal():
     import tempfile as _tf
     with _tf.TemporaryDirectory() as tmp:
