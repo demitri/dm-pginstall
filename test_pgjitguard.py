@@ -47,11 +47,17 @@ LDD_HEALTHY = LDD_BROKEN.replace(
 
 
 class FakeState:
-    """Stands in for JitState where only the derived package set matters."""
+    """Stands in for JitState where only the derived package sets matter."""
 
-    def __init__(self, packages, module="/usr/local/postgresql/lib/llvmjit.so"):
+    def __init__(self, packages, llvm_packages=None,
+                 module="/usr/local/postgresql/lib/llvmjit.so",
+                 pg_config="/usr/local/postgresql-18.1/bin/pg_config"):
         self.packages = packages
+        # Default: whatever looks like an LLVM runtime package.
+        self.llvm_packages = (llvm_packages if llvm_packages is not None
+                              else [p for p in packages if "llvm" in p])
         self.module = Path(module)
+        self.pg_config = Path(pg_config)
 
 
 failures = []
@@ -150,7 +156,7 @@ def test_pin_left_behind_by_rebuild_is_a_gap():
 
 def test_hold_dropped_outside_the_tool_is_a_gap():
     restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": True, "libc6": False},
+                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)},
                    currently_held=lambda: ["libc6"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
@@ -164,7 +170,7 @@ def test_hold_dropped_outside_the_tool_is_a_gap():
 
 def test_hold_covering_current_packages_is_protected():
     restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": True, "libc6": False},
+                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)},
                    currently_held=lambda: ["libc6", "libllvm21"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
@@ -196,7 +202,7 @@ def test_has_protection_detects_each_method():
         restore()
 
     restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": True})
+                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)})
     try:
         check("depends absent", g.has_protection(g.Method.DEPENDS), False)
         check("hold present", g.has_protection(g.Method.HOLD), True)
@@ -213,13 +219,19 @@ def test_hold_manifest_roundtrip_preserves_auto_flags():
         manifest = Path(tmp) / "held-packages.txt"
         restore = stub(HOLD_MANIFEST=manifest)
         try:
-            original = {"libllvm21": True, "libc6": False}
+            original = {
+                "libllvm21": g.HoldRecord(was_auto=True, was_held=False),
+                "libc6": g.HoldRecord(was_auto=False, was_held=True),
+            }
             g.write_hold_manifest(original, FakeState(["libllvm21", "libc6"]))
             check("roundtrip", g.read_hold_manifest(), original)
+            back = g.read_hold_manifest()
             # Only the auto ones may be handed back to apt's autoremove.
-            restored = sorted(p for p, was_auto in
-                              g.read_hold_manifest().items() if was_auto)
-            check("only auto restored", restored, ["libllvm21"])
+            check("only auto restored",
+                  sorted(p for p, r in back.items() if r.was_auto), ["libllvm21"])
+            # A package already held before we ran is someone else's policy.
+            check("pre-existing hold not ours",
+                  sorted(p for p, r in back.items() if r.was_held), ["libc6"])
         finally:
             restore()
 
@@ -268,22 +280,122 @@ def test_installed_pin_depends_strips_versions_and_alternatives():
 # apt hook rendering
 # ---------------------------------------------------------------------------
 
-def test_apt_hook_embeds_pg_config_and_stays_valid_apt_conf():
-    hook = g.APT_HOOK_TEMPLATE.format(
+def rendered_hook():
+    return g.APT_HOOK_TEMPLATE.format(
         script="/usr/local/sbin/pgjitguard",
         pg_config="/usr/local/postgresql-18.1/bin/pg_config",
     )
+
+
+def test_apt_hook_stays_valid_apt_conf():
+    hook = rendered_hook()
     expected = ('DPkg::Post-Invoke { "/usr/local/sbin/pgjitguard --pg-config '
-                "'/usr/local/postgresql-18.1/bin/pg_config' check --hook "
-                '--quiet || true"; };')
+                "'/usr/local/postgresql-18.1/bin/pg_config' --quiet check "
+                '--hook || true"; };')
     check("hook line", expected in hook, True)
-    # Scope ordering to the command itself: the comment block above it also
-    # contains the word "check".
-    command = [ln for ln in hook.splitlines() if ln.startswith("DPkg::")][0]
-    # --pg-config is a top-level option, so it must precede the subcommand.
-    check("option precedes subcommand",
-          command.index("--pg-config") < command.index(" check"), True)
     check("braces survive format", hook.count("{") == hook.count("}") == 1, True)
+
+
+def test_apt_hook_command_actually_parses():
+    """Regression: --quiet sat after the subcommand, so argparse rejected the
+    whole hook. '|| true' swallowed the exit code, so every apt transaction
+    printed a usage error and checked nothing. Asserting on the rendered text
+    missed it entirely -- the command has to be executed through parse_args."""
+    import shlex
+
+    command = [ln for ln in rendered_hook().splitlines()
+               if ln.startswith("DPkg::")][0]
+    inner = command.split('"')[1]              # the shell command apt runs
+    argv = shlex.split(inner)
+    argv = argv[:argv.index("||")]             # drop the "|| true" guard
+
+    saved = sys.argv
+    sys.argv = argv
+    try:
+        args = g.parse_args()
+    except SystemExit as exc:
+        check("hook command must parse", f"argparse exited {exc.code}", "parsed")
+        return
+    finally:
+        sys.argv = saved
+
+    check("hook runs check", args.command, "check")
+    check("hook sets --hook", args.hook, True)
+    check("hook sets --quiet", args.quiet, True)
+    check("hook names the installation", args.pg_config,
+          "/usr/local/postgresql-18.1/bin/pg_config")
+
+
+def test_release_leaves_pre_existing_holds_alone():
+    """A hold that predates pgjitguard is someone else's policy; unholding it
+    on unprotect would silently revoke an unrelated decision."""
+    calls = []
+
+    def fake_run(cmd, check=True):
+        calls.append(cmd)
+        return 0, "", ""
+
+    restore = stub(run=fake_run)
+    try:
+        ours, theirs = g.release_hold_packages({
+            "libllvm21": g.HoldRecord(was_auto=True, was_held=False),
+            "libc6": g.HoldRecord(was_auto=False, was_held=True),
+        })
+        check("only ours released", ours, ["libllvm21"])
+        check("theirs reported back", theirs, ["libc6"])
+        check("unhold excludes the pre-existing hold",
+              [c for c in calls if c[:2] == ["apt-mark", "unhold"]],
+              [["apt-mark", "unhold", "libllvm21"]])
+        check("auto restored only where it was auto",
+              [c for c in calls if c[:2] == ["apt-mark", "auto"]],
+              [["apt-mark", "auto", "libllvm21"]])
+    finally:
+        restore()
+
+
+def test_jitstate_separates_llvm_packages_from_the_rest():
+    """Hold mode is scoped to the LLVM runtime: holding libc6 would block its
+    security updates to guard against a retirement that never happens."""
+    resolved = {
+        "libLLVM.so.21.1": "/lib/x86_64-linux-gnu/libLLVM.so.21.1",
+        "libstdc++.so.6": "/lib/x86_64-linux-gnu/libstdc++.so.6",
+        "libc.so.6": "/lib/x86_64-linux-gnu/libc.so.6",
+    }
+    owners = {
+        "/lib/x86_64-linux-gnu/libLLVM.so.21.1": "libllvm21",
+        "/lib/x86_64-linux-gnu/libstdc++.so.6": "libstdc++6",
+        "/lib/x86_64-linux-gnu/libc.so.6": "libc6",
+    }
+    restore = stub(
+        get_pg_setting=lambda pc, flag: "PostgreSQL 18.1",
+        find_llvmjit=lambda pc: Path("/usr/local/postgresql/lib/llvmjit.so"),
+        direct_needed=lambda m: list(resolved),
+        resolve_deps=lambda m: resolved,
+        dpkg_owner=lambda path: owners.get(path),
+    )
+    try:
+        state = g.JitState(Path("/usr/local/postgresql-18.1/bin/pg_config"))
+        check("depends covers every dpkg-owned dep", state.packages,
+              ["libc6", "libllvm21", "libstdc++6"])
+        check("hold scope is the LLVM runtime only", state.llvm_packages,
+              ["libllvm21"])
+        check("nothing unresolved", state.missing, [])
+    finally:
+        restore()
+
+
+def test_remediation_command_names_the_installation():
+    """Every 'run this to fix it' message must carry --pg-config, or it sends
+    the user back to the default symlink."""
+    saved = sys.argv
+    sys.argv = ["/usr/local/sbin/pgjitguard"]
+    try:
+        check("remediation carries --pg-config",
+              g.remediation_command(FakeState(["libllvm21"])),
+              "sudo pgjitguard --pg-config "
+              "/usr/local/postgresql-18.1/bin/pg_config protect")
+    finally:
+        sys.argv = saved
 
 
 # ---------------------------------------------------------------------------

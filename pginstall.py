@@ -334,12 +334,6 @@ def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
     protect_cmd = ["sudo", str(guard), "--pg-config", str(pg_config), "protect"]
     protect_hint = f"sudo {guard} --pg-config {pg_config} protect"
 
-    if not pg_config.is_file():
-        print(f"\n  Expected pg_config at {pg_config}, but it is not there.")
-        print("  Skipping; run this once the installation is in place:")
-        print(f"    {protect_hint}")
-        return
-
     if detect_package_manager() != "apt":
         # The enforcement mechanisms are dpkg-specific; say so rather than
         # leaving the impression that nothing needs doing.
@@ -350,8 +344,17 @@ def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
         print(f"    {guard} --pg-config {pg_config} status")
         return
 
+    # Ahead of the existence check: during a dry run of a new version the
+    # versioned path legitimately does not exist yet, and the point of a dry
+    # run is to show the plan rather than report the absence.
     if dry_run:
         print(f"\n  [dry-run] Would offer to run: {protect_hint}")
+        return
+
+    if not pg_config.is_file():
+        print(f"\n  Expected pg_config at {pg_config}, but it is not there.")
+        print("  Skipping; run this once the installation is in place:")
+        print(f"    {protect_hint}")
         return
 
     if not sys.stdin.isatty():

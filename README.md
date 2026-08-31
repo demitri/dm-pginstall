@@ -241,8 +241,20 @@ the next upgrade. `check` warns about the same drift without failing.
 
 | Method | How it works | Trade-off |
 |--------|--------------|-----------|
-| `depends` (default) | Generates a small `.deb` whose `Depends:` are the owning packages | apt models the dependency properly: removal refused, breaking upgrades warn, autoremove can't reap it, security updates still apply |
-| `hold` | `apt-mark manual` + `hold` on the same packages | Nothing generated and reversible with `apt-mark`, but it also blocks security updates for those packages |
+| `depends` (default) | Generates a small `.deb` whose `Depends:` are **every** dpkg-owned dependency | apt models the dependency properly: removal refused, breaking upgrades warn, autoremove can't reap it, security updates still apply |
+| `hold` | `apt-mark manual` + `hold` on the **LLVM runtime** packages only | Nothing generated and reversible with `apt-mark`, but a hold blocks the held package's security updates |
+
+The scopes differ deliberately. Declaring a dependency costs nothing, so
+`depends` covers everything `llvmjit.so` links against. A hold has a real cost,
+so it covers only the LLVM runtime — the one dependency whose package name
+carries its version, meaning a successor arrives as a *separate* package and the
+old one gets retired. `libc6` and friends upgrade in place and are never
+withdrawn, so holding them would block their security updates to guard against
+something that cannot happen.
+
+`unprotect` restores apt's original state: packages it marked manual go back to
+automatic, and a package that was *already* held before `pgjitguard` ran is left
+held, since that is someone else's policy to revoke.
 
 `pginstall.py` offers to run `protect` after any JIT-enabled build.
 
