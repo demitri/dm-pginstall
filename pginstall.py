@@ -234,9 +234,12 @@ def find_llvm_config() -> Optional[str]:
     # the second pass, '--build-llvm --no-alias' would build a private LLVM that
     # a later ordinary rebuild could never find, silently falling back to the
     # system toolchain this feature exists to avoid.
+    # Completeness matters here, not just the presence of llvm-config: a
+    # half-installed newer tree would otherwise outrank a working older one and
+    # PostgreSQL would fail later, missing clang or libLLVM.
     candidates: list[str] = []
     alias = INSTALL_BASE / "llvm" / "bin" / "llvm-config"
-    if alias.is_file():
+    if alias.is_file() and llvm_install_is_complete(alias.parent.parent.resolve()):
         candidates.append(str(alias.resolve()))
 
     private_versioned: list[tuple[tuple[int, ...], str]] = []
@@ -244,6 +247,9 @@ def find_llvm_config() -> Optional[str]:
         match = re.match(r"^llvm-(\d+(?:\.\d+)*)$", path.parent.parent.name)
         if match:
             key = tuple(int(part) for part in match.group(1).split("."))
+            if not llvm_install_is_complete(path.parent.parent):
+                print(f"  Ignoring incomplete LLVM install: {path.parent.parent}")
+                continue
             # Resolved like the alias branch: this path is baked into
             # PostgreSQL's rpath, so it must be concrete.
             private_versioned.append((key, str(path.resolve())))
@@ -852,35 +858,53 @@ def get_latest_ast_version() -> str:
 
 def load_versions(config_path: Optional[Path], exclude_ast: bool = False,
                   build_llvm: bool = False) -> dict:
-    """Load versions from config file, falling back to auto-detect."""
-    versions = {}
+    """Resolve component versions, preferring the config file over discovery.
 
-    # Auto-detect all versions first
+    The config is read first and upstream is queried only for what it does not
+    pin. Detecting every version up front and then overriding it meant a fully
+    pinned configuration still failed offline, or when GitHub rate-limited the
+    request -- pinning exists precisely to avoid depending on that.
+    """
     plat = get_platform()
 
-    print("\nDetecting versions...")
+    detectors = {
+        "openssl": get_latest_openssl_version,
+        "icu": get_latest_icu_version,
+        "postgresql": get_latest_postgresql_version,
+        "q3c": get_latest_q3c_version,
+    }
     if plat == "darwin":
-        versions["readline"] = get_latest_readline_version()
-    versions["openssl"] = get_latest_openssl_version()
-    versions["icu"] = get_latest_icu_version()
+        detectors["readline"] = get_latest_readline_version
     if build_llvm:
-        versions["llvm"] = get_latest_llvm_version()
-    versions["postgresql"] = get_latest_postgresql_version()
-    versions["q3c"] = get_latest_q3c_version()
+        detectors["llvm"] = get_latest_llvm_version
     if not exclude_ast:
-        versions["ast"] = get_latest_ast_version()
-        versions["pgast"] = get_latest_pgast_version()
+        detectors["ast"] = get_latest_ast_version
+        detectors["pgast"] = get_latest_pgast_version
 
-    # Override with config file if provided
+    pinned: dict[str, str] = {}
     if config_path and config_path.exists():
         print(f"\nLoading config from: {config_path}")
         config = configparser.ConfigParser()
         config.read(config_path)
         if "versions" in config:
             for key, value in config["versions"].items():
-                if key in versions or key == "readline":
-                    print(f"  Overriding {key}: {value}")
-                    versions[key] = value
+                if key in detectors:
+                    pinned[key] = value
+                else:
+                    # Never silently drop a pin: an ignored key means the user
+                    # thinks they pinned something they did not.
+                    print(f"  Ignoring '{key} = {value}': not built in this run")
+
+    versions: dict[str, str] = {}
+    to_detect = [key for key in detectors if key not in pinned]
+    if to_detect:
+        print("\nDetecting versions...")
+    for key, detect in detectors.items():
+        if key in pinned:
+            print(f"  {key}: {pinned[key]} (pinned)")
+            versions[key] = pinned[key]
+        else:
+            versions[key] = detect()
 
     return versions
 
@@ -2006,11 +2030,26 @@ Shell completions:
     return parser.parse_args()
 
 
-def get_required_tools(exclude_ast: bool = False,
-                       build_llvm: bool = False) -> list[str]:
+# What each component actually needs, beyond the always-required basics.
+# Only components with a genuinely smaller footprint are listed; anything
+# absent falls back to the full set, which is the safe direction -- an
+# over-strict pre-flight check is better than a build that dies halfway.
+COMPONENT_TOOLS = {
+    "llvm": ["make", "gcc", "tar", "cmake", "ninja", "c++"],
+}
+
+
+def get_required_tools(exclude_ast: bool = False, build_llvm: bool = False,
+                       component: Optional[str] = None) -> list[str]:
     """Return list of required tools for the current platform."""
-    tools = ["make", "gcc", "tar", "git", "bison", "flex"]
     plat = get_platform()
+
+    # Building only LLVM needs none of PostgreSQL's bison/flex/patchelf, nor
+    # gfortran for AST. Checking for them would block a valid run.
+    if component in COMPONENT_TOOLS:
+        return list(COMPONENT_TOOLS[component])
+
+    tools = ["make", "gcc", "tar", "git", "bison", "flex"]
 
     # LLVM is C++ and needs its own toolchain. The documented Linux
     # prerequisites install a C compiler only, so a clean setup would otherwise
@@ -2065,10 +2104,11 @@ def find_pkg_config() -> Optional[str]:
     return shutil.which("pkg-config")
 
 
-def check_missing_tools(exclude_ast: bool = False,
-                        build_llvm: bool = False) -> list[str]:
+def check_missing_tools(exclude_ast: bool = False, build_llvm: bool = False,
+                        component: Optional[str] = None) -> list[str]:
     """Return list of missing required tools."""
-    required = get_required_tools(exclude_ast=exclude_ast, build_llvm=build_llvm)
+    required = get_required_tools(exclude_ast=exclude_ast, build_llvm=build_llvm,
+                                  component=component)
     missing = []
     for tool in required:
         if tool == "patchelf":
@@ -2203,13 +2243,16 @@ def check_src_dir(dry_run: bool = False) -> bool:
 
 
 def check_prerequisites(dry_run: bool = False, exclude_ast: bool = False,
-                        build_llvm: bool = False) -> list[str]:
+                        build_llvm: bool = False,
+                        component: Optional[str] = None) -> list[str]:
     """Check that required tools and libraries are available. Returns list of missing items."""
     print("Checking prerequisites...")
 
     missing_tools = check_missing_tools(exclude_ast=exclude_ast,
-                                        build_llvm=build_llvm)
-    missing_libs = check_missing_libraries()
+                                        build_llvm=build_llvm,
+                                        component=component)
+    # readline/zlib headers are PostgreSQL's, not LLVM's.
+    missing_libs = [] if component in COMPONENT_TOOLS else check_missing_libraries()
     missing = missing_tools + missing_libs
 
     if missing:
@@ -2290,7 +2333,8 @@ def main() -> None:
     will_build_llvm = args.build_llvm and args.component in (None, "llvm")
     missing_tools = check_prerequisites(dry_run=args.dry_run,
                                         exclude_ast=args.exclude_ast,
-                                        build_llvm=will_build_llvm)
+                                        build_llvm=will_build_llvm,
+                                        component=args.component)
 
     # In dry-run mode, show install commands for missing prerequisites
     if args.dry_run and missing_tools:

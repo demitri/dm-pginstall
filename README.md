@@ -342,17 +342,14 @@ unresolved — doing so would record the wrong set. Rebuild first, then protect.
 If no dpkg package owns the LLVM runtime — the case after
 [`--build-llvm`](#building-a-private-llvm) — every command reports that there is
 nothing to protect, because no apt operation can remove it. A pin left over from
-before the switch is removed then, but only after checking that no *other*
-installed PostgreSQL still links a system LLVM: the pin is global while
-installations are per-version, so dropping it too eagerly would unprotect a
-sibling. Anything that cannot be inspected counts as still needing it.
+before the switch is then rebuilt around whatever the *remaining* installations
+need, or removed outright if none do.
 
-> **Scope**: this guards one installation at a time — the one `--pg-config`
-> names, defaulting to the `/usr/local/postgresql` symlink. The generated
-> package uses a fixed name, so protecting a second
-> installation replaces the first rather than adding to it. With side-by-side
-> PostgreSQL versions, protect the one whose JIT you rely on, or build them
-> against the same LLVM.
+> **Side-by-side versions**: the generated package has a fixed name and is
+> therefore system-wide, while PostgreSQL installations are per-version. It
+> declares the *union* of what every at-risk installation needs, so protecting
+> one does not unprotect another. An installation that cannot be inspected is
+> reported and treated as still needing protection.
 
 Run `./test_pgjitguard.py` and `./test_pginstall.py` to exercise the parsing,
 drift-detection, and LLVM toolchain-selection logic. Both use recorded fixtures

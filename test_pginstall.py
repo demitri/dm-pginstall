@@ -54,10 +54,8 @@ def test_find_llvm_config_prefers_a_private_build(monkeypatched=None):
     PostgreSQL rebuilds keep using it without extra flags."""
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
+        make_llvm_tree(base / "llvm")
         private = base / "llvm" / "bin" / "llvm-config"
-        private.parent.mkdir(parents=True)
-        private.write_text("#!/bin/sh\n")
-        private.chmod(0o755)
 
         saved = p.INSTALL_BASE
         p.INSTALL_BASE = base
@@ -152,10 +150,7 @@ def test_private_build_is_rediscovered_without_an_alias():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         for version in ("20.1.8", "23.1.0"):
-            binned = base / f"llvm-{version}" / "bin"
-            binned.mkdir(parents=True)
-            (binned / "llvm-config").write_text("#!/bin/sh\n")
-            (binned / "llvm-config").chmod(0o755)
+            make_llvm_tree(base / f"llvm-{version}")
         # Deliberately no 'llvm' symlink, as --no-alias leaves it.
         check("no alias present", (base / "llvm").exists(), False)
 
@@ -174,10 +169,7 @@ def test_private_rediscovery_prefers_the_newest_version():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         for version in ("9.0.1", "23.1.0"):
-            binned = base / f"llvm-{version}" / "bin"
-            binned.mkdir(parents=True)
-            (binned / "llvm-config").write_text("#!/bin/sh\n")
-            (binned / "llvm-config").chmod(0o755)
+            make_llvm_tree(base / f"llvm-{version}")
 
         saved = p.INSTALL_BASE
         p.INSTALL_BASE = base
@@ -196,6 +188,7 @@ def make_llvm_tree(base, with_clang=True, with_runtime=True):
     (base / "bin").mkdir(parents=True, exist_ok=True)
     (base / "lib").mkdir(parents=True, exist_ok=True)
     (base / "bin" / "llvm-config").write_text("#!/bin/sh\n")
+    (base / "bin" / "llvm-config").chmod(0o755)
     if with_clang:
         (base / "bin" / "clang").write_text("#!/bin/sh\n")
     if with_runtime:
@@ -224,6 +217,56 @@ def test_partial_llvm_install_is_rejected():
               p.llvm_install_is_complete(Path(tmp) / "nonexistent"), False)
 
 
+def test_incomplete_private_build_is_not_selected():
+    """An interrupted 'cmake --install' leaves a newer tree with llvm-config but
+    no clang. Preferring it by version alone would fail the PostgreSQL build
+    later, having passed over a complete older install."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        make_llvm_tree(base / "llvm-20.1.8")                       # complete
+        make_llvm_tree(base / "llvm-23.1.0", with_clang=False)     # interrupted
+
+        saved = p.INSTALL_BASE
+        p.INSTALL_BASE = base
+        try:
+            check("skips the incomplete newer tree", p.find_llvm_config(),
+                  str((base / "llvm-20.1.8" / "bin" / "llvm-config").resolve()))
+        finally:
+            p.INSTALL_BASE = saved
+
+
+def test_pinned_versions_need_no_network():
+    """Pinning exists to avoid depending on upstream availability. Detecting
+    everything first and overriding afterwards meant a fully pinned config
+    still failed offline or when GitHub rate-limited."""
+    def explode():
+        raise AssertionError("upstream was queried despite a pinned version")
+
+    saved = {name: getattr(p, name) for name in
+             ("get_latest_openssl_version", "get_latest_icu_version",
+              "get_latest_postgresql_version", "get_latest_q3c_version",
+              "get_latest_llvm_version", "get_latest_readline_version")}
+    for name in saved:
+        setattr(p, name, explode)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config = Path(tmp) / "pginstall.conf"
+        config.write_text(
+            "[versions]\n"
+            "postgresql = 18.6\nopenssl = 3.6.1\nicu = 76.1\n"
+            "q3c = 2.0.1\nllvm = 20.1.8\nreadline = 8.2\n"
+        )
+        try:
+            versions = p.load_versions(config, exclude_ast=True, build_llvm=True)
+            check("llvm pinned without a network call", versions["llvm"], "20.1.8")
+            check("postgresql pinned", versions["postgresql"], "18.6")
+        except AssertionError as exc:
+            check("no upstream query for pinned versions", str(exc), "(none)")
+        finally:
+            for name, fn in saved.items():
+                setattr(p, name, fn)
+
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
@@ -245,10 +288,7 @@ def test_find_llvm_config_resolves_the_alias_to_a_versioned_path():
     feature exists to prevent, self-inflicted."""
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
-        versioned = base / "llvm-23.1.0" / "bin"
-        versioned.mkdir(parents=True)
-        (versioned / "llvm-config").write_text("#!/bin/sh\n")
-        (versioned / "llvm-config").chmod(0o755)
+        make_llvm_tree(base / "llvm-23.1.0")
         (base / "llvm").symlink_to(base / "llvm-23.1.0")
 
         saved = p.INSTALL_BASE

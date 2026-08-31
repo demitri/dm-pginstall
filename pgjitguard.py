@@ -352,7 +352,8 @@ def next_pin_version() -> str:
     return "1.1"
 
 
-def build_pin_package(state: JitState, version: str, workdir: Path) -> Path:
+def build_pin_package(state: JitState, version: str, workdir: Path,
+                      packages: list[str]) -> Path:
     """Build the dependency .deb from the module's real dependencies."""
     dpkg_deb = require_tool("dpkg-deb", "dpkg")
 
@@ -371,7 +372,7 @@ def build_pin_package(state: JitState, version: str, workdir: Path) -> Path:
         f"pg_config:   {state.pg_config}",
         f"postgresql:  {state.pg_version}",
         f"module:      {state.module}",
-        f"depends:     {', '.join(state.packages)}",
+        f"depends:     {', '.join(packages)}",
         "",
         "# Direct dependencies of llvmjit.so at the time of pinning:",
     ]
@@ -388,7 +389,7 @@ Architecture: all
 Maintainer: pgjitguard <root@localhost>
 Section: misc
 Priority: optional
-Depends: {', '.join(state.packages)}
+Depends: {', '.join(packages)}
 Description: Pin runtime libraries needed by a source-built PostgreSQL JIT
  PostgreSQL built from source with --with-llvm links its JIT module against a
  specific versioned LLVM runtime ({llvm}). dpkg has no
@@ -407,8 +408,8 @@ Description: Pin runtime libraries needed by a source-built PostgreSQL JIT
     return deb
 
 
-def apply_depends(state: JitState, dry_run: bool) -> int:
-    """Install a generated package declaring the JIT module's dependencies."""
+def apply_depends(state: JitState, dry_run: bool, packages: list[str]) -> int:
+    """Install a generated package declaring the JIT dependencies to protect."""
     version = next_pin_version()
     current = installed_pin_version()
 
@@ -422,11 +423,11 @@ def apply_depends(state: JitState, dry_run: bool) -> int:
     require_root("protect")
 
     with tempfile.TemporaryDirectory(prefix="pgjitguard-") as tmp:
-        deb = build_pin_package(state, version, Path(tmp))
+        deb = build_pin_package(state, version, Path(tmp), packages)
         print(f"\nInstalling {deb.name} ...")
         run(["dpkg", "-i", str(deb)])
 
-    print(f"\nProtected. apt will refuse to remove: {', '.join(state.packages)}")
+    print(f"\nProtected. apt will refuse to remove: {', '.join(packages)}")
     if current:
         print("\nThe previous dependency set has been replaced. Any LLVM runtime it")
         print("protected that nothing else needs is now reclaimable:")
@@ -469,35 +470,49 @@ def remove_depends(dry_run: bool) -> int:
 # --------------------------------------------------------------------------
 
 
-def siblings_needing_the_pin(current: Path) -> tuple[list[Path], list[Path]]:
-    """Find other PostgreSQL installations that still depend on a system LLVM.
+def at_risk_installations(current: JitState) -> tuple[
+        list[tuple[Path, list[str]]], list[Path]]:
+    """Every PostgreSQL installation whose JIT needs a dpkg-owned LLVM.
 
-    The pin package is global while installations are per-version, and this
-    repository supports side-by-side versions. Removing the pin because *this*
-    build moved to a private LLVM would strip protection from a sibling still
-    linked against the system one.
+    Includes `current` when it is itself at risk. The pin package has a fixed
+    name and is therefore system-wide, while installations are per-version and
+    this repository supports them side by side. Declaring only the installation
+    being protected would silently drop the packages a sibling depends on --
+    and, on the cleanup path, would keep a pin that does not actually cover the
+    sibling it is being kept for.
 
-    Returns (at_risk, uninspectable). Anything we could not inspect counts as a
-    reason not to remove the pin: guessing in the permissive direction would
-    silently unprotect a working installation.
+    Returns (contributors, uninspectable). Anything that cannot be inspected is
+    reported rather than skipped: guessing permissively unprotects a working
+    build, which is the failure this tool exists to prevent.
     """
-    at_risk: list[Path] = []
+    contributors: list[tuple[Path, list[str]]] = []
     uninspectable: list[Path] = []
 
+    if current.has_jit and current.is_at_risk:
+        contributors.append((current.pg_config, current.packages))
+
     for pg_config in sorted(INSTALL_BASE.glob("postgresql-*/bin/pg_config")):
-        if pg_config.resolve() == current.resolve():
+        if pg_config.resolve() == current.pg_config.resolve():
             continue
         try:
             sibling = JitState(pg_config)
         except SystemExit:
-            # JitState exits on an unreadable module. Not fatal here, but not
-            # ignorable either -- record it and stay conservative.
+            # JitState exits on an unreadable module; not fatal here, but not
+            # ignorable either.
             uninspectable.append(pg_config)
             continue
         if sibling.has_jit and sibling.is_at_risk:
-            at_risk.append(pg_config)
+            contributors.append((pg_config, sibling.packages))
 
-    return at_risk, uninspectable
+    return contributors, uninspectable
+
+
+def union_pin_packages(current: JitState) -> tuple[
+        list[str], list[tuple[Path, list[str]]], list[Path]]:
+    """The package set one system-wide pin must declare to cover every install."""
+    contributors, uninspectable = at_risk_installations(current)
+    packages = sorted({pkg for _, pkgs in contributors for pkg in pkgs})
+    return packages, contributors, uninspectable
 
 
 def remediation_command(state: JitState, action: str = "protect") -> str:
@@ -531,14 +546,16 @@ def protection_gaps(state: JitState) -> tuple[list[str], list[str]]:
     protected_by: list[str] = []
     gaps: list[str] = []
 
-    if not state.is_at_risk:
-        # A privately built LLVM is outside apt's reach. Reporting a "gap" here
-        # would nag about protection that is neither possible nor needed.
+    required, _, _ = union_pin_packages(state)
+    if not required:
+        # Nothing anywhere depends on a dpkg-owned LLVM -- the private-LLVM end
+        # state. An installed pin is then redundant rather than protective, so
+        # claim neither protection nor a gap; cmd_status reports it as obsolete.
         return protected_by, gaps
 
     if installed_pin_version():
         depends = installed_pin_depends()
-        uncovered = [p for p in state.packages if p not in depends]
+        uncovered = [p for p in required if p not in depends]
         if uncovered:
             gaps.append(f"{PIN_PACKAGE} does not depend on: {', '.join(uncovered)}")
         else:
@@ -603,12 +620,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("\n  Nothing to protect: no dpkg package owns the LLVM runtime")
         print(f"  ({state.llvm_provider}), so an apt upgrade cannot remove it.")
         if installed_pin_version():
-            at_risk, uninspectable = siblings_needing_the_pin(state.pg_config)
-            if at_risk or uninspectable:
+            required, contributors, uninspectable = union_pin_packages(state)
+            if contributors or uninspectable:
                 print(f"\n  {PIN_PACKAGE} is installed and still needed by other")
                 print("  installations:")
-                for path in at_risk + uninspectable:
-                    print(f"    {path}")
+                for path, packages in contributors:
+                    print(f"    {path}  ({', '.join(packages)})")
+                for path in uninspectable:
+                    print(f"    {path}  (could not inspect)")
+                missing = [p for p in required if p not in installed_pin_depends()]
+                if missing:
+                    print(f"\n  ...but it does not cover: {', '.join(missing)}")
+                    print(f"  Re-run: {remediation_command(state)}")
             else:
                 print(f"\n  {PIN_PACKAGE} is OBSOLETE: it still depends on the LLVM")
                 print("  this build no longer uses, which stops apt reclaiming it.")
@@ -749,23 +772,32 @@ def cmd_protect(args: argparse.Namespace) -> int:
         # A pin from before the switch still depends on the old system LLVM,
         # which keeps apt from ever reclaiming it. Leaving it installed would
         # quietly pin a runtime nothing uses any more.
-        if installed_pin_version():
-            at_risk, uninspectable = siblings_needing_the_pin(state.pg_config)
-            if at_risk or uninspectable:
-                # The pin is global; another installation is still relying on it.
-                print(f"\n{PIN_PACKAGE} is installed but must stay: other")
-                print("PostgreSQL installations still link a dpkg-owned LLVM.")
-                for path in at_risk:
-                    print(f"  still at risk:   {path}")
-                for path in uninspectable:
-                    print(f"  could not check: {path}  (treated as still needed)")
-                print("\nRebuild those against a private LLVM too, then re-run this")
-                print("to drop the pin.")
-                return EXIT_OK
+        required, contributors, uninspectable = union_pin_packages(state)
 
-            print(f"\n{PIN_PACKAGE} is installed and now obsolete: it still")
-            print("depends on the LLVM this build no longer uses, and no other")
-            print("installation needs it.")
+        if contributors:
+            # Other installations still need protecting. Rebuild the pin around
+            # exactly what they need: keeping the old one is not enough, since
+            # it may name a runtime none of them actually uses.
+            print("\nOther PostgreSQL installations still link a dpkg-owned LLVM:")
+            for path, packages in contributors:
+                print(f"  {path}  ({', '.join(packages)})")
+            for path in uninspectable:
+                print(f"  {path}  (could not inspect; leaving protection in place)")
+            print("\nRebuilding the pin to cover them:")
+            print(f"Depends on:  {', '.join(required)}")
+            return apply_depends(state, args.dry_run, required)
+
+        if uninspectable:
+            print("\nLeaving the pin alone: these installations could not be")
+            print("inspected, and removing protection they might need is worse")
+            print("than keeping a pin that is merely redundant.")
+            for path in uninspectable:
+                print(f"  {path}")
+            return EXIT_OK
+
+        if installed_pin_version():
+            print(f"\n{PIN_PACKAGE} is installed and now obsolete: it depends on")
+            print("an LLVM no installation uses any more.")
             result = remove_depends(args.dry_run)
             if result != EXIT_OK:
                 return result
@@ -780,8 +812,20 @@ def cmd_protect(args: argparse.Namespace) -> int:
         for entry in state.untracked:
             print(f"  {entry}")
 
+    required, contributors, uninspectable = union_pin_packages(state)
+    if len(contributors) > 1:
+        # One system-wide package name, several installations: it must declare
+        # all of them or protecting this one would unprotect the others.
+        print("\nAlso covering other installations that need a system LLVM:")
+        for path, packages in contributors:
+            if path.resolve() != state.pg_config.resolve():
+                print(f"  {path}  ({', '.join(packages)})")
+        print(f"Combined:    {', '.join(required)}")
+    for path in uninspectable:
+        print(f"  WARNING: could not inspect {path}; its needs are not covered")
+
     print()
-    return apply_depends(state, args.dry_run)
+    return apply_depends(state, args.dry_run, required)
 
 
 def cmd_unprotect(args: argparse.Namespace) -> int:

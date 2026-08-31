@@ -58,6 +58,7 @@ class FakeState:
                               else [p for p in packages if "llvm" in p])
         self.module = Path(module)
         self.pg_config = Path(pg_config)
+        self.has_jit = True
 
     @property
     def is_at_risk(self):
@@ -195,31 +196,65 @@ def test_system_llvm_is_still_at_risk():
           FakeState(["libc6", "libllvm21"]).is_at_risk, True)
 
 
-def test_pin_is_kept_when_a_sibling_install_still_needs_it():
-    """The pin package is global while installations are per-version. Removing
-    it because THIS build moved to a private LLVM would strip protection from a
-    sibling still linked against the system one."""
+def make_installs(base, versions):
+    for version in versions:
+        binned = base / f"postgresql-{version}" / "bin"
+        binned.mkdir(parents=True)
+        (binned / "pg_config").write_text("#!/bin/sh\n")
+    return base
+
+
+def test_pin_covers_every_installation_that_needs_it():
+    """One pin package, several installations. Declaring only the one being
+    protected would silently drop the packages a sibling depends on -- and on
+    the cleanup path, would keep a pin that does not cover the sibling it is
+    being kept for."""
     import tempfile as _tf
     with _tf.TemporaryDirectory() as tmp:
-        base = Path(tmp)
-        for version in ("18.3", "18.6"):
-            binned = base / f"postgresql-{version}" / "bin"
-            binned.mkdir(parents=True)
-            (binned / "pg_config").write_text("#!/bin/sh\n")
+        base = make_installs(Path(tmp), ["18.3", "18.6"])
+        current = FakeState(["libc6", "libllvm21"],
+                            pg_config=str(base / "postgresql-18.6" / "bin" / "pg_config"))
+        current.has_jit = True
 
-        current = base / "postgresql-18.6" / "bin" / "pg_config"
-        sibling = base / "postgresql-18.3" / "bin" / "pg_config"
+        class Sibling:            # still on the older system LLVM
+            has_jit = True
+            is_at_risk = True
+            packages = ["libc6", "libllvm20"]
+
+        restore = stub(INSTALL_BASE=base, JitState=lambda pc: Sibling())
+        try:
+            required, contributors, uninspectable = g.union_pin_packages(current)
+            check("union covers both runtimes", required,
+                  ["libc6", "libllvm20", "libllvm21"])
+            check("both installations contribute", len(contributors), 2)
+            check("nothing uninspectable", uninspectable, [])
+        finally:
+            restore()
+
+
+def test_pin_gap_detected_when_it_misses_a_sibling():
+    """The reported failure: a pin naming libllvm21 was retained as 'needed' by
+    a sibling that actually uses libllvm20, leaving the sibling unprotected."""
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        base = make_installs(Path(tmp), ["18.3", "18.6"])
+        current = FakeState(["libllvm21"],
+                            pg_config=str(base / "postgresql-18.6" / "bin" / "pg_config"))
+        current.has_jit = True
 
         class Sibling:
             has_jit = True
             is_at_risk = True
+            packages = ["libllvm20"]
 
-        restore = stub(INSTALL_BASE=base, JitState=lambda pc: Sibling())
+        restore = stub(INSTALL_BASE=base, JitState=lambda pc: Sibling(),
+                       installed_pin_version=lambda: "1.2",
+                       installed_pin_depends=lambda: ["libllvm21"])
         try:
-            at_risk, uninspectable = g.siblings_needing_the_pin(current)
-            check("sibling detected", at_risk, [sibling])
-            check("current install excluded", current in at_risk, False)
-            check("nothing uninspectable", uninspectable, [])
+            by, gaps = g.protection_gaps(current)
+            check("not counted as protected", by, [])
+            check("the sibling's runtime is reported uncovered", gaps,
+                  [f"{g.PIN_PACKAGE} does not depend on: libllvm20"])
         finally:
             restore()
 
@@ -229,43 +264,43 @@ def test_uninspectable_sibling_blocks_pin_removal():
     assumed safe, since guessing wrong silently unprotects a working build."""
     import tempfile as _tf
     with _tf.TemporaryDirectory() as tmp:
-        base = Path(tmp)
-        binned = base / "postgresql-18.3" / "bin"
-        binned.mkdir(parents=True)
-        (binned / "pg_config").write_text("#!/bin/sh\n")
+        base = make_installs(Path(tmp), ["18.3"])
+        current = FakeState([], llvm_packages=[],
+                            pg_config=str(base / "postgresql-18.6" / "bin" / "pg_config"))
+        current.has_jit = True
 
         def explode(pg_config):
             raise SystemExit(2)
 
         restore = stub(INSTALL_BASE=base, JitState=explode)
         try:
-            at_risk, uninspectable = g.siblings_needing_the_pin(
-                base / "postgresql-18.6" / "bin" / "pg_config")
+            required, contributors, uninspectable = g.union_pin_packages(current)
             check("counted as uninspectable", uninspectable,
-                  [binned / "pg_config"])
-            check("not silently treated as safe", at_risk, [])
+                  [base / "postgresql-18.3" / "bin" / "pg_config"])
+            check("not silently treated as safe", contributors, [])
+            check("no packages inferred", required, [])
         finally:
             restore()
 
 
 def test_private_sibling_does_not_block_pin_removal():
-    class PrivateSibling:
-        has_jit = True
-        is_at_risk = False
-
     import tempfile as _tf
     with _tf.TemporaryDirectory() as tmp:
-        base = Path(tmp)
-        binned = base / "postgresql-18.3" / "bin"
-        binned.mkdir(parents=True)
-        (binned / "pg_config").write_text("#!/bin/sh\n")
+        base = make_installs(Path(tmp), ["18.3"])
+        current = FakeState([], llvm_packages=[],
+                            pg_config=str(base / "postgresql-18.6" / "bin" / "pg_config"))
+        current.has_jit = True
+
+        class PrivateSibling:
+            has_jit = True
+            is_at_risk = False
+            packages = ["libc6"]
 
         restore = stub(INSTALL_BASE=base, JitState=lambda pc: PrivateSibling())
         try:
-            at_risk, uninspectable = g.siblings_needing_the_pin(
-                base / "postgresql-18.6" / "bin" / "pg_config")
-            check("private sibling is not a blocker", (at_risk, uninspectable),
-                  ([], []))
+            required, contributors, uninspectable = g.union_pin_packages(current)
+            check("nothing needs the pin", (required, contributors, uninspectable),
+                  ([], [], []))
         finally:
             restore()
 
