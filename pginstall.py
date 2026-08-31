@@ -297,7 +297,7 @@ def get_llvm_install_command() -> Optional[str]:
     return None
 
 
-def offer_jit_protection(dry_run: bool) -> None:
+def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
     """After a JIT-enabled build, offer to make the LLVM dependency visible to apt.
 
     llvmjit.so links against a specific versioned LLVM runtime that the package
@@ -305,6 +305,11 @@ def offer_jit_protection(dry_run: bool) -> None:
     runtime: the server still starts and cheap queries still work, so the
     breakage only surfaces when a query crosses jit_above_cost. pgjitguard.py
     derives the dependency from the built module and enforces it.
+
+    pg_config must be the concrete versioned path of the build we just made.
+    pgjitguard defaults to the /usr/local/postgresql symlink, which --no-alias
+    (or a declined symlink update) can leave pointing at an older installation —
+    protecting that one would report success while leaving this build exposed.
     """
     if get_platform() != "linux":
         return
@@ -324,37 +329,49 @@ def offer_jit_protection(dry_run: bool) -> None:
         print("  Restore it to protect the dependency automatically.")
         return
 
+    # Name the build explicitly rather than letting pgjitguard fall back to the
+    # /usr/local/postgresql symlink, which may point at a different version.
+    protect_cmd = ["sudo", str(guard), "--pg-config", str(pg_config), "protect"]
+    protect_hint = f"sudo {guard} --pg-config {pg_config} protect"
+
+    if not pg_config.is_file():
+        print(f"\n  Expected pg_config at {pg_config}, but it is not there.")
+        print("  Skipping; run this once the installation is in place:")
+        print(f"    {protect_hint}")
+        return
+
     if detect_package_manager() != "apt":
         # The enforcement mechanisms are dpkg-specific; say so rather than
         # leaving the impression that nothing needs doing.
         print("\n  Automatic protection requires a dpkg-based system. On this")
         print("  distribution, prevent the LLVM runtime from being removed using")
         print("  your package manager's equivalent (e.g. 'dnf versionlock').")
-        print(f"\n  To inspect the dependency at any time:\n    {guard} status")
+        print(f"\n  To inspect the dependency at any time:")
+        print(f"    {guard} --pg-config {pg_config} status")
         return
 
     if dry_run:
-        print(f"\n  [dry-run] Would offer to run: sudo {guard} protect")
+        print(f"\n  [dry-run] Would offer to run: {protect_hint}")
         return
 
     if not sys.stdin.isatty():
         print("\n  Not running on a terminal, so skipping the prompt. To protect")
-        print(f"  the dependency, run:\n    sudo {guard} protect")
+        print(f"  the dependency, run:\n    {protect_hint}")
         return
 
     if not prompt_yes_no("\n  Protect this dependency now?", default=True):
-        print(f"\n  Skipped. To do it later, run:\n    sudo {guard} protect")
+        print(f"\n  Skipped. To do it later, run:\n    {protect_hint}")
         return
 
     # pgjitguard prompts for the enforcement method itself.
-    result = subprocess.run(["sudo", str(guard), "protect"])
+    result = subprocess.run(protect_cmd)
     if result.returncode != 0:
         print(f"\n  pgjitguard exited {result.returncode}; the dependency is NOT",
               file=sys.stderr)
-        print(f"  protected. To retry:\n    sudo {guard} protect", file=sys.stderr)
+        print(f"  protected. To retry:\n    {protect_hint}", file=sys.stderr)
         return
 
-    print(f"\n  Re-run 'sudo {guard} protect' after any future PostgreSQL rebuild.")
+    print(f"\n  Re-run this after any future PostgreSQL rebuild:\n    {protect_hint}")
 
 
 def check_existing(install_path: Path) -> bool:
@@ -2069,7 +2086,12 @@ def main() -> None:
     print(f"Add to your PATH: export PATH={INSTALL_BASE / 'postgresql' / 'bin'}:$PATH")
 
     if building_pg and use_llvm:
-        offer_jit_protection(args.dry_run)
+        # The versioned path, not the symlink: --no-alias may have left the
+        # symlink pointing at a different installation than the one just built.
+        pg_config = (
+            INSTALL_BASE / f"postgresql-{versions['postgresql']}" / "bin" / "pg_config"
+        )
+        offer_jit_protection(args.dry_run, pg_config)
 
 
 if __name__ == "__main__":

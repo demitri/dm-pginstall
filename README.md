@@ -226,7 +226,16 @@ sudo ./pgjitguard.py protect
 
 # Run the check automatically after every apt transaction
 sudo ./pgjitguard.py install-hook
+
+# ... and remove it again
+sudo ./pgjitguard.py uninstall-hook
 ```
+
+`status` compares what is actually enforced against what `llvmjit.so` needs
+*now*, rather than just checking that some protection exists. After a rebuild
+against a different LLVM it reports the old runtime as still protected and the
+new one as exposed, which is the state that would otherwise go unnoticed until
+the next upgrade. `check` warns about the same drift without failing.
 
 `protect` offers two enforcement methods:
 
@@ -251,6 +260,19 @@ Options:
 
 `protect` refuses to run against a module whose dependencies are already
 unresolved — doing so would record the wrong set. Rebuild first, then protect.
+Switching methods removes the one it replaces, so a superseded `hold` cannot go
+on silently blocking security updates.
+
+> **Scope**: this guards one installation at a time — the one `--pg-config`
+> names, defaulting to the `/usr/local/postgresql` symlink. The generated
+> package and the manifests use fixed names, so protecting a second
+> installation replaces the first rather than adding to it. With side-by-side
+> PostgreSQL versions, protect the one whose JIT you rely on, or build them
+> against the same LLVM.
+
+Run `./test_pgjitguard.py` to exercise the parsing, drift-detection, and
+manifest logic. The tests use recorded fixtures and need no dpkg, apt, or
+running PostgreSQL.
 
 ### create_pg_service.py (Linux only)
 
@@ -671,6 +693,7 @@ The installer auto-detects latest versions from:
 | `pgjitguard.py` | Protects the JIT module's LLVM dependency from system upgrades (Linux) |
 | `add_rpaths_to_dylibs.py` | Rpath fixer for shared libraries |
 | `test_install.sh` | Post-installation verification script |
+| `test_pgjitguard.py` | Fixture-based tests for `pgjitguard.py` (no apt required) |
 | `pginstall.conf.example` | Example configuration file |
 
 ## License
