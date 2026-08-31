@@ -145,6 +145,49 @@ def test_build_postgresql_requires_the_concrete_llvm_identity():
           True)
 
 
+def test_private_build_is_rediscovered_without_an_alias():
+    """--build-llvm --no-alias creates no /usr/local/llvm symlink. If discovery
+    only looked there, a later ordinary rebuild would silently fall back to the
+    system toolchain the private build exists to avoid."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for version in ("20.1.8", "23.1.0"):
+            binned = base / f"llvm-{version}" / "bin"
+            binned.mkdir(parents=True)
+            (binned / "llvm-config").write_text("#!/bin/sh\n")
+            (binned / "llvm-config").chmod(0o755)
+        # Deliberately no 'llvm' symlink, as --no-alias leaves it.
+        check("no alias present", (base / "llvm").exists(), False)
+
+        saved = p.INSTALL_BASE
+        p.INSTALL_BASE = base
+        try:
+            got = p.find_llvm_config()
+            check("finds the versioned private build", got,
+                  str((base / "llvm-23.1.0" / "bin" / "llvm-config").resolve()))
+        finally:
+            p.INSTALL_BASE = saved
+
+
+def test_private_rediscovery_prefers_the_newest_version():
+    """Numeric ordering, so llvm-9 cannot outrank llvm-23."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for version in ("9.0.1", "23.1.0"):
+            binned = base / f"llvm-{version}" / "bin"
+            binned.mkdir(parents=True)
+            (binned / "llvm-config").write_text("#!/bin/sh\n")
+            (binned / "llvm-config").chmod(0o755)
+
+        saved = p.INSTALL_BASE
+        p.INSTALL_BASE = base
+        try:
+            check("23 beats 9", p.find_llvm_config(),
+                  str((base / "llvm-23.1.0" / "bin" / "llvm-config").resolve()))
+        finally:
+            p.INSTALL_BASE = saved
+
+
 # ---------------------------------------------------------------------------
 # Is a half-installed LLVM mistaken for a finished one?
 # ---------------------------------------------------------------------------

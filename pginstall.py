@@ -230,10 +230,27 @@ def find_llvm_config() -> Optional[str]:
     # would break an existing build the moment the symlink is repointed at a
     # newer LLVM -- the same "the runtime moved underneath us" failure this
     # whole feature exists to prevent, just self-inflicted.
-    private = INSTALL_BASE / "llvm" / "bin" / "llvm-config"
+    # The alias first when present, then any versioned private install. Without
+    # the second pass, '--build-llvm --no-alias' would build a private LLVM that
+    # a later ordinary rebuild could never find, silently falling back to the
+    # system toolchain this feature exists to avoid.
     candidates: list[str] = []
-    if private.is_file():
-        candidates.append(str(private.resolve()))
+    alias = INSTALL_BASE / "llvm" / "bin" / "llvm-config"
+    if alias.is_file():
+        candidates.append(str(alias.resolve()))
+
+    private_versioned: list[tuple[tuple[int, ...], str]] = []
+    for path in INSTALL_BASE.glob("llvm-*/bin/llvm-config"):
+        match = re.match(r"^llvm-(\d+(?:\.\d+)*)$", path.parent.parent.name)
+        if match:
+            key = tuple(int(part) for part in match.group(1).split("."))
+            # Resolved like the alias branch: this path is baked into
+            # PostgreSQL's rpath, so it must be concrete.
+            private_versioned.append((key, str(path.resolve())))
+    private_versioned.sort(key=lambda item: item[0], reverse=True)
+    for _, path in private_versioned:
+        if path not in candidates:
+            candidates.append(path)
 
     if get_platform() == "linux":
         # Versioned toolchains first, highest version wins. Compare as version
@@ -357,6 +374,12 @@ def offer_jit_protection(dry_run: bool, pg_config: Path,
     # /usr/local/postgresql symlink, which may point at a different version.
     protect_cmd = ["sudo", str(guard), "--pg-config", str(pg_config), "protect"]
     protect_hint = f"sudo {guard} --pg-config {pg_config} protect"
+
+    if private_llvm and detect_package_manager() != "apt":
+        # Nothing to protect and no dpkg to clean up. Saying anything about
+        # versionlock here would contradict the banner above.
+        print("\n  Nothing further to do.")
+        return
 
     if detect_package_manager() != "apt":
         # The enforcement mechanisms are dpkg-specific; say so rather than
@@ -1238,9 +1261,10 @@ def build_llvm(
 
     print(f"\n  This is a large build: expect roughly 30-90 minutes and several")
     print(f"  GB of disk under {SRC_DIR}.")
-    print(f"\n  Note: this is the newest stable LLVM ({version}). PostgreSQL")
-    print("  usually trails new LLVM majors by a release or two. If the build")
-    print("  or JIT misbehaves, pin a known-good version in the config file:")
+    print(f"\n  Note: building LLVM {version}. PostgreSQL usually trails new")
+    print("  LLVM majors by a release or two, and this defaults to the newest")
+    print("  stable release. If the build or JIT misbehaves, pin a known-good")
+    print("  version in the config file:")
     print("    [versions]\n    llvm = 20.1.8")
     print(f"  Compile jobs: {cpu_count}, link jobs: {link_jobs} (linking LLVM"
           " needs several GB each)")
@@ -2260,9 +2284,13 @@ def main() -> None:
         print("\n*** DRY RUN MODE - No changes will be made ***")
 
     # Check prerequisites
+    # Only demand cmake/ninja/c++ when this run will actually build LLVM.
+    # '--component postgresql --build-llvm' links against an existing private
+    # LLVM and needs none of them.
+    will_build_llvm = args.build_llvm and args.component in (None, "llvm")
     missing_tools = check_prerequisites(dry_run=args.dry_run,
                                         exclude_ast=args.exclude_ast,
-                                        build_llvm=args.build_llvm)
+                                        build_llvm=will_build_llvm)
 
     # In dry-run mode, show install commands for missing prerequisites
     if args.dry_run and missing_tools:

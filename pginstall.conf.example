@@ -9,6 +9,7 @@
 # postgresql = 17.2
 # openssl = 3.6.1
 # icu = 76.1
+# llvm = 20.1.8          # only used with --build-llvm
 # readline = 8.2
 # q3c = 2.0.1
 # ast = 9.3.0

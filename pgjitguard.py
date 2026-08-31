@@ -60,7 +60,8 @@ from pathlib import Path
 from typing import Optional
 
 # Constants - match the project conventions
-PG_BASE = Path("/usr/local/postgresql")
+INSTALL_BASE = Path("/usr/local")
+PG_BASE = INSTALL_BASE / "postgresql"
 PG_BIN = PG_BASE / "bin"
 
 # Generated dependency package
@@ -468,6 +469,37 @@ def remove_depends(dry_run: bool) -> int:
 # --------------------------------------------------------------------------
 
 
+def siblings_needing_the_pin(current: Path) -> tuple[list[Path], list[Path]]:
+    """Find other PostgreSQL installations that still depend on a system LLVM.
+
+    The pin package is global while installations are per-version, and this
+    repository supports side-by-side versions. Removing the pin because *this*
+    build moved to a private LLVM would strip protection from a sibling still
+    linked against the system one.
+
+    Returns (at_risk, uninspectable). Anything we could not inspect counts as a
+    reason not to remove the pin: guessing in the permissive direction would
+    silently unprotect a working installation.
+    """
+    at_risk: list[Path] = []
+    uninspectable: list[Path] = []
+
+    for pg_config in sorted(INSTALL_BASE.glob("postgresql-*/bin/pg_config")):
+        if pg_config.resolve() == current.resolve():
+            continue
+        try:
+            sibling = JitState(pg_config)
+        except SystemExit:
+            # JitState exits on an unreadable module. Not fatal here, but not
+            # ignorable either -- record it and stay conservative.
+            uninspectable.append(pg_config)
+            continue
+        if sibling.has_jit and sibling.is_at_risk:
+            at_risk.append(pg_config)
+
+    return at_risk, uninspectable
+
+
 def remediation_command(state: JitState, action: str = "protect") -> str:
     """Render the command that fixes things, naming the installation explicitly.
 
@@ -571,9 +603,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("\n  Nothing to protect: no dpkg package owns the LLVM runtime")
         print(f"  ({state.llvm_provider}), so an apt upgrade cannot remove it.")
         if installed_pin_version():
-            print(f"\n  {PIN_PACKAGE} is OBSOLETE: it still depends on the LLVM")
-            print("  this build no longer uses, which stops apt reclaiming it.")
-            print(f"  Remove it with: {remediation_command(state, 'unprotect')}")
+            at_risk, uninspectable = siblings_needing_the_pin(state.pg_config)
+            if at_risk or uninspectable:
+                print(f"\n  {PIN_PACKAGE} is installed and still needed by other")
+                print("  installations:")
+                for path in at_risk + uninspectable:
+                    print(f"    {path}")
+            else:
+                print(f"\n  {PIN_PACKAGE} is OBSOLETE: it still depends on the LLVM")
+                print("  this build no longer uses, which stops apt reclaiming it.")
+                print(f"  Remove it with: {remediation_command(state, 'unprotect')}")
     else:
         print("\n  Nothing is protecting these packages. An LLVM upgrade can still")
         print(f"  break JIT. Run: {remediation_command(state)}")
@@ -711,8 +750,22 @@ def cmd_protect(args: argparse.Namespace) -> int:
         # which keeps apt from ever reclaiming it. Leaving it installed would
         # quietly pin a runtime nothing uses any more.
         if installed_pin_version():
+            at_risk, uninspectable = siblings_needing_the_pin(state.pg_config)
+            if at_risk or uninspectable:
+                # The pin is global; another installation is still relying on it.
+                print(f"\n{PIN_PACKAGE} is installed but must stay: other")
+                print("PostgreSQL installations still link a dpkg-owned LLVM.")
+                for path in at_risk:
+                    print(f"  still at risk:   {path}")
+                for path in uninspectable:
+                    print(f"  could not check: {path}  (treated as still needed)")
+                print("\nRebuild those against a private LLVM too, then re-run this")
+                print("to drop the pin.")
+                return EXIT_OK
+
             print(f"\n{PIN_PACKAGE} is installed and now obsolete: it still")
-            print("depends on the LLVM this build no longer uses.")
+            print("depends on the LLVM this build no longer uses, and no other")
+            print("installation needs it.")
             result = remove_depends(args.dry_run)
             if result != EXIT_OK:
                 return result

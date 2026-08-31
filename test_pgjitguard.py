@@ -195,6 +195,81 @@ def test_system_llvm_is_still_at_risk():
           FakeState(["libc6", "libllvm21"]).is_at_risk, True)
 
 
+def test_pin_is_kept_when_a_sibling_install_still_needs_it():
+    """The pin package is global while installations are per-version. Removing
+    it because THIS build moved to a private LLVM would strip protection from a
+    sibling still linked against the system one."""
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for version in ("18.3", "18.6"):
+            binned = base / f"postgresql-{version}" / "bin"
+            binned.mkdir(parents=True)
+            (binned / "pg_config").write_text("#!/bin/sh\n")
+
+        current = base / "postgresql-18.6" / "bin" / "pg_config"
+        sibling = base / "postgresql-18.3" / "bin" / "pg_config"
+
+        class Sibling:
+            has_jit = True
+            is_at_risk = True
+
+        restore = stub(INSTALL_BASE=base, JitState=lambda pc: Sibling())
+        try:
+            at_risk, uninspectable = g.siblings_needing_the_pin(current)
+            check("sibling detected", at_risk, [sibling])
+            check("current install excluded", current in at_risk, False)
+            check("nothing uninspectable", uninspectable, [])
+        finally:
+            restore()
+
+
+def test_uninspectable_sibling_blocks_pin_removal():
+    """Conservative on purpose: an install we cannot inspect must not be
+    assumed safe, since guessing wrong silently unprotects a working build."""
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        binned = base / "postgresql-18.3" / "bin"
+        binned.mkdir(parents=True)
+        (binned / "pg_config").write_text("#!/bin/sh\n")
+
+        def explode(pg_config):
+            raise SystemExit(2)
+
+        restore = stub(INSTALL_BASE=base, JitState=explode)
+        try:
+            at_risk, uninspectable = g.siblings_needing_the_pin(
+                base / "postgresql-18.6" / "bin" / "pg_config")
+            check("counted as uninspectable", uninspectable,
+                  [binned / "pg_config"])
+            check("not silently treated as safe", at_risk, [])
+        finally:
+            restore()
+
+
+def test_private_sibling_does_not_block_pin_removal():
+    class PrivateSibling:
+        has_jit = True
+        is_at_risk = False
+
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        binned = base / "postgresql-18.3" / "bin"
+        binned.mkdir(parents=True)
+        (binned / "pg_config").write_text("#!/bin/sh\n")
+
+        restore = stub(INSTALL_BASE=base, JitState=lambda pc: PrivateSibling())
+        try:
+            at_risk, uninspectable = g.siblings_needing_the_pin(
+                base / "postgresql-18.6" / "bin" / "pg_config")
+            check("private sibling is not a blocker", (at_risk, uninspectable),
+                  ([], []))
+        finally:
+            restore()
+
+
 # ---------------------------------------------------------------------------
 # Pin version bumping -- must always be an upgrade, never a reinstall
 # ---------------------------------------------------------------------------
