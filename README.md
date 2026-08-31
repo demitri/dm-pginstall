@@ -34,6 +34,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 |-----------|-------------|--------------|
 | ICU | International Components for Unicode | `/usr/local/icu-x.y` |
 | OpenSSL | Cryptographic library (required by pgcrypto) | `/usr/local/openssl-x.y.z` |
+| LLVM | LLVM + clang for JIT (only with `--build-llvm`) | `/usr/local/llvm-x.y.z` |
 | PostgreSQL | PostgreSQL database server | `/usr/local/postgresql-x.y` |
 | readline | GNU Readline (macOS only) | `/usr/local/readline-x.y` |
 
@@ -63,6 +64,12 @@ sudo apt install build-essential bison flex libreadline-dev zlib1g-dev patchelf 
 For JIT support (optional but recommended):
 ```bash
 sudo apt install llvm-dev clang
+```
+
+To build a private LLVM instead (`--build-llvm`), which is immune to distro LLVM
+upgrades:
+```bash
+sudo apt install cmake ninja-build
 ```
 
 > **Note**: `gfortran` is required for building the Starlink AST library. If using `--exclude-ast`, it can be omitted.
@@ -105,12 +112,14 @@ Options:
   --component NAME    Build only specific component
   --skip-extensions   Skip q3c, ast, and pgast
   --exclude-ast       Exclude Starlink AST library and pgast extension
+  --with-llvm         Enable LLVM/JIT support
+  --build-llvm        Build LLVM from source rather than using the system LLVM
   --verbose           Show all build output
   --completions SHELL Output shell completion script (bash or zsh)
   -h, --help          Show help message
 ```
 
-**Components:** `readline`, `openssl`, `icu`, `postgresql`, `contrib`, `q3c`, `ast`, `pgast`
+**Components:** `readline`, `openssl`, `icu`, `llvm`, `postgresql`, `contrib`, `q3c`, `ast`, `pgast`
 
 #### Examples
 
@@ -132,7 +141,48 @@ Options:
 
 # Use a config file for version pinning
 ./pginstall.py --config pginstall.conf
+
+# Build a private LLVM so distro upgrades can never break JIT
+./pginstall.py --build-llvm
 ```
+
+### Building a private LLVM
+
+PostgreSQL built with `--with-llvm` links `llvmjit.so` against a specific
+versioned LLVM runtime. When that runtime is the *system* LLVM, the package
+manager has no record of the dependency, so a distribution upgrade can retire it
+and break JIT — silently, since the module is loaded lazily and only queries
+above `jit_above_cost` fail.
+
+`--build-llvm` removes the failure mode instead of guarding against it. LLVM and
+clang are built from source into `/usr/local/llvm-<version>`, PostgreSQL is
+linked against that, and an rpath is baked in so `llvmjit.so` finds it at
+runtime. Nothing the package manager does can touch it.
+
+```bash
+# Build LLVM, then PostgreSQL against it (implies --with-llvm)
+./pginstall.py --build-llvm
+
+# See exactly what would happen first
+./pginstall.py --build-llvm --dry-run
+
+# Build only LLVM
+./pginstall.py --build-llvm --component llvm
+```
+
+Once built, `/usr/local/llvm/bin/llvm-config` is preferred over any system LLVM
+automatically, so later PostgreSQL rebuilds keep using it with no extra flags.
+
+> **This is a long build.** Expect roughly 30–90 minutes and several GB under
+> `/usr/local/src`. It needs `cmake` (and uses `ninja` if present, which is
+> substantially faster). Only the host target is built, and link jobs are capped
+> independently of compile jobs, since linking LLVM needs several GB per job and
+> one link per core will exhaust memory on most machines.
+
+clang is built alongside LLVM and passed to `configure` as `CLANG=`. PostgreSQL
+uses clang to emit the bitcode that `llvmjit.so` consumes, and the two must come
+from the same LLVM — letting `configure` find an unrelated clang on `PATH` risks
+a version mismatch between the bitcode and the runtime that reads it.
 
 ### install_pgvector.py
 
@@ -221,7 +271,7 @@ from the built module, never hand-maintained.
 # Verify JIT still works, by running a query that forces JIT compilation
 ./pgjitguard.py check --live
 
-# Enforce the dependency (prompts for the method)
+# Declare the dependency to apt
 sudo ./pgjitguard.py protect
 
 # Run the check automatically after every apt transaction
