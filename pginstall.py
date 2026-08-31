@@ -2399,9 +2399,15 @@ def main() -> None:
         ("llvm", "LLVM"), ("postgresql", "PostgreSQL"), ("q3c", "q3c"),
         ("ast", "AST"), ("pgast", "pgast"),
     ]
+    # '--component postgresql --build-llvm' links against a private LLVM that
+    # must already exist; only a run that includes the llvm component builds it.
+    building_llvm_now = args.build_llvm and args.component in (None, "llvm")
     for key, label in labels:
         if key in versions:
-            note = " (built from source)" if key == "llvm" else ""
+            note = ""
+            if key == "llvm":
+                note = (" (built from source)" if building_llvm_now
+                        else " (private toolchain, must already exist)")
             print(f"  {label + ':':<12}{versions[key]}{note}")
     if args.exclude_ast and args.component is None:
         print(f"  {'AST:':<12}(excluded)")
