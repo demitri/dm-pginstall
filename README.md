@@ -69,7 +69,7 @@ sudo apt install llvm-dev clang
 To build a private LLVM instead (`--build-llvm`), which is immune to distro LLVM
 upgrades:
 ```bash
-sudo apt install cmake ninja-build
+sudo apt install cmake ninja-build g++
 ```
 
 > **Note**: `gfortran` is required for building the Starlink AST library. If using `--exclude-ast`, it can be omitted.
@@ -84,6 +84,14 @@ For JIT support:
 ```bash
 sudo dnf install llvm-devel clang
 ```
+
+To build a private LLVM instead (`--build-llvm`):
+```bash
+sudo dnf install cmake ninja-build gcc-c++
+```
+
+> **Note**: the base Fedora prerequisites above install `gcc` but not `gcc-c++`.
+> LLVM is C++, so `--build-llvm` needs it explicitly.
 
 ### macOS
 
@@ -174,10 +182,14 @@ Once built, `/usr/local/llvm/bin/llvm-config` is preferred over any system LLVM
 automatically, so later PostgreSQL rebuilds keep using it with no extra flags.
 
 > **This is a long build.** Expect roughly 30–90 minutes and several GB under
-> `/usr/local/src`. It needs `cmake` (and uses `ninja` if present, which is
-> substantially faster). Only the host target is built, and link jobs are capped
-> independently of compile jobs, since linking LLVM needs several GB per job and
-> one link per core will exhaust memory on most machines.
+> `/usr/local/src`. It needs `cmake`, `ninja`, and a C++ compiler. Only the host
+> target is built, and link jobs are capped independently of compile jobs, since
+> linking LLVM needs several GB per job and one link per core will exhaust
+> memory on most machines.
+>
+> `ninja` is required rather than merely preferred: the link-job cap is a
+> Ninja-only feature that Unix Makefiles silently ignore, so falling back to
+> `make` would quietly remove the memory guard.
 
 clang is built alongside LLVM and passed to `configure` as `CLANG=`. PostgreSQL
 uses clang to emit the bitcode that `llvmjit.so` consumes, and the two must come
@@ -326,9 +338,9 @@ nothing to protect, because no apt operation can remove it.
 > PostgreSQL versions, protect the one whose JIT you rely on, or build them
 > against the same LLVM.
 
-Run `./test_pgjitguard.py` to exercise the parsing, drift-detection, and
-manifest logic. The tests use recorded fixtures and need no dpkg, apt, or
-running PostgreSQL.
+Run `./test_pgjitguard.py` and `./test_pginstall.py` to exercise the parsing,
+drift-detection, and LLVM toolchain-selection logic. Both use recorded fixtures
+and need no dpkg, apt, LLVM, network, or running PostgreSQL.
 
 ### create_pg_service.py (Linux only)
 
@@ -750,6 +762,7 @@ The installer auto-detects latest versions from:
 | `add_rpaths_to_dylibs.py` | Rpath fixer for shared libraries |
 | `test_install.sh` | Post-installation verification script |
 | `test_pgjitguard.py` | Fixture-based tests for `pgjitguard.py` (no apt required) |
+| `test_pginstall.py` | Tests for LLVM toolchain selection (no LLVM or network required) |
 | `pginstall.conf.example` | Example configuration file |
 
 ## License

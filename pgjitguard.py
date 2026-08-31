@@ -570,6 +570,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     elif not state.is_at_risk:
         print("\n  Nothing to protect: no dpkg package owns the LLVM runtime")
         print(f"  ({state.llvm_provider}), so an apt upgrade cannot remove it.")
+        if installed_pin_version():
+            print(f"\n  {PIN_PACKAGE} is OBSOLETE: it still depends on the LLVM")
+            print("  this build no longer uses, which stops apt reclaiming it.")
+            print(f"  Remove it with: {remediation_command(state, 'unprotect')}")
     else:
         print("\n  Nothing is protecting these packages. An LLVM upgrade can still")
         print(f"  break JIT. Run: {remediation_command(state)}")
@@ -702,6 +706,18 @@ def cmd_protect(args: argparse.Namespace) -> int:
         print("\nNothing to protect: no dpkg package owns the LLVM runtime, so an")
         print("apt upgrade cannot remove it. This is the outcome that")
         print("'pginstall.py --build-llvm' is for.")
+
+        # A pin from before the switch still depends on the old system LLVM,
+        # which keeps apt from ever reclaiming it. Leaving it installed would
+        # quietly pin a runtime nothing uses any more.
+        if installed_pin_version():
+            print(f"\n{PIN_PACKAGE} is installed and now obsolete: it still")
+            print("depends on the LLVM this build no longer uses.")
+            result = remove_depends(args.dry_run)
+            if result != EXIT_OK:
+                return result
+            if not args.dry_run:
+                print("\nThe old LLVM is now reclaimable:\n  sudo apt autoremove")
         return EXIT_OK
 
     print(f"JIT module:  {state.module}")
@@ -821,13 +837,12 @@ def parse_args() -> argparse.Namespace:
 Examples:
   %(prog)s                          # what does llvmjit.so need, and is it safe?
   %(prog)s check --live             # verify by running a JIT-compiled query
-  sudo %(prog)s protect             # enforce the dependency (asks how)
-  sudo %(prog)s protect -m depends  # ... or choose the method up front
+  sudo %(prog)s protect             # declare the dependency to apt
   sudo %(prog)s install-hook        # check automatically after every apt run
 
 After rebuilding PostgreSQL against a newer LLVM, re-run "sudo %(prog)s protect".
-Either method re-derives the dependency set from the rebuilt module, protects
-the new runtime, and releases the old one for "apt autoremove" to reclaim.
+It re-derives the dependency set from the rebuilt module, protects the new
+runtime, and releases the old one for "apt autoremove" to reclaim.
 """,
     )
     parser.add_argument("--pg-config", metavar="PATH",

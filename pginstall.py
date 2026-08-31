@@ -1094,6 +1094,33 @@ def build_openssl(version: str, dry_run: bool = False, verbose: bool = False, no
     print(f"  OpenSSL {version} installed successfully")
 
 
+def private_llvm_config(version: str) -> Path:
+    """Path to the llvm-config of a --build-llvm toolchain.
+
+    Deliberately the versioned path rather than the /usr/local/llvm symlink:
+    --no-alias skips creating that symlink, and discovery would then miss the
+    LLVM we just built and quietly settle for a system one -- the very
+    dependency --build-llvm exists to avoid.
+    """
+    return INSTALL_BASE / f"llvm-{version}" / "bin" / "llvm-config"
+
+
+def llvm_install_is_complete(install_path: Path) -> bool:
+    """Return True only if an LLVM install has the pieces PostgreSQL needs.
+
+    The presence of the directory proves nothing: a 'cmake --install' that dies
+    partway leaves one behind. Trusting it would make every retry a no-op and
+    could alias a broken tree into /usr/local/llvm.
+    """
+    if not (install_path / "bin" / "llvm-config").is_file():
+        return False
+    if not (install_path / "bin" / "clang").is_file():
+        return False
+    libdir = install_path / "lib"
+    # llvmjit.so links the shared runtime; a static-only tree is unusable here.
+    return any(libdir.glob("libLLVM*.so*")) or any(libdir.glob("libLLVM*.dylib"))
+
+
 def build_llvm(
     version: str, dry_run: bool = False, verbose: bool = False, no_alias: bool = False
 ) -> None:
@@ -1116,10 +1143,16 @@ def build_llvm(
     print(f"{'=' * 60}")
 
     if check_existing(install_path):
-        print(f"  Already installed: {install_path}")
-        if not no_alias:
-            create_symlink(install_path, symlink_path, dry_run)
-        return
+        if llvm_install_is_complete(install_path):
+            print(f"  Already installed: {install_path}")
+            if not no_alias:
+                create_symlink(install_path, symlink_path, dry_run)
+            return
+        # Loud, and rebuild: silently aliasing a half-installed LLVM would
+        # surface much later as a confusing PostgreSQL build failure.
+        print(f"  Found an incomplete LLVM installation at {install_path}")
+        print("  (missing llvm-config, clang, or the shared LLVM runtime)")
+        print("  Rebuilding it.")
 
     # cmake is not needed by any other component, so it is not in the
     # documented prerequisites. Say so plainly rather than failing mid-build.
@@ -1127,10 +1160,10 @@ def build_llvm(
         print("\nError: building LLVM requires cmake, which was not found.",
               file=sys.stderr)
         install_cmd = {
-            "apt": "sudo apt install cmake ninja-build",
-            "dnf": "sudo dnf install cmake ninja-build",
-            "yum": "sudo yum install cmake ninja-build",
-            "pacman": "sudo pacman -S cmake ninja",
+            "apt": "sudo apt install cmake ninja-build g++",
+            "dnf": "sudo dnf install cmake ninja-build gcc-c++",
+            "yum": "sudo yum install cmake ninja-build gcc-c++",
+            "pacman": "sudo pacman -S cmake ninja gcc",
         }.get(detect_package_manager())
         if install_cmd:
             print(f"  Install it with:\n    {install_cmd}", file=sys.stderr)
@@ -1138,8 +1171,25 @@ def build_llvm(
               file=sys.stderr)
         sys.exit(1)
 
-    # Ninja is substantially faster for a build this size, but not required.
-    generator = "Ninja" if shutil.which("ninja") else "Unix Makefiles"
+    # Ninja is required, not merely faster: LLVM_PARALLEL_LINK_JOBS below is a
+    # Ninja-only feature. Under Unix Makefiles it is silently ignored, so -j
+    # would start one link per core -- several GB each -- and exhaust memory on
+    # most machines. Degrading to Makefiles would quietly remove the guard.
+    if not dry_run and not shutil.which("ninja"):
+        print("\nError: building LLVM requires ninja.", file=sys.stderr)
+        print("  It caps parallel link jobs, which Unix Makefiles cannot do;"
+              " without it", file=sys.stderr)
+        print("  the link step will likely exhaust memory.", file=sys.stderr)
+        install_cmd = {
+            "apt": "sudo apt install ninja-build",
+            "dnf": "sudo dnf install ninja-build",
+            "yum": "sudo yum install ninja-build",
+            "pacman": "sudo pacman -S ninja",
+        }.get(detect_package_manager())
+        if install_cmd:
+            print(f"  Install it with:\n    {install_cmd}", file=sys.stderr)
+        sys.exit(1)
+    generator = "Ninja"
 
     cpu_count = get_cpu_count()
     # Linking LLVM is memory-hungry: several GB per link job. Running one link
@@ -1148,7 +1198,8 @@ def build_llvm(
 
     print(f"\n  This is a large build: expect roughly 30-90 minutes and several")
     print(f"  GB of disk under {SRC_DIR}.")
-    print(f"  Generator: {generator}, compile jobs: {cpu_count}, link jobs: {link_jobs}")
+    print(f"  Compile jobs: {cpu_count}, link jobs: {link_jobs} (linking LLVM"
+          " needs several GB each)")
 
     url = (f"https://github.com/llvm/llvm-project/releases/download/"
            f"llvmorg-{version}/llvm-project-{version}.src.tar.xz")
@@ -1199,9 +1250,10 @@ def build_llvm(
         create_symlink(install_path, symlink_path, dry_run)
 
     if not dry_run:
-        llvm_config = install_path / "bin" / "llvm-config"
-        if not llvm_config.is_file():
-            print(f"Error: LLVM install completed but {llvm_config} is missing.",
+        if not llvm_install_is_complete(install_path):
+            print(f"Error: LLVM install finished but {install_path} is missing",
+                  file=sys.stderr)
+            print("  llvm-config, clang, or the shared LLVM runtime.",
                   file=sys.stderr)
             sys.exit(1)
         print(f"\n  LLVM installed: {install_path}")
@@ -1216,6 +1268,11 @@ def build_postgresql(
     """Build PostgreSQL from source."""
     install_path = INSTALL_BASE / f"postgresql-{version}"
     symlink_path = INSTALL_BASE / "postgresql"
+
+    # Resolved up front: the rebuild check below compares the concrete
+    # LLVM_CONFIG, so it has to be known before that decision is made.
+    if with_llvm and llvm_config is None:
+        llvm_config = find_llvm_config()
 
     print(f"\n{'=' * 60}")
     print(f"Building PostgreSQL {version}")
@@ -1255,6 +1312,14 @@ def build_postgresql(
     required_configure_flags = ["--with-icu", "--with-openssl"]
     if with_llvm:
         required_configure_flags.append("--with-llvm")
+        # Identity, not just presence. An existing build may already carry
+        # --with-llvm while pointing at a different LLVM -- the system one, or
+        # an older private one. Requiring the concrete LLVM_CONFIG forces a
+        # rebuild when the toolchain changes; without it, --build-llvm can
+        # spend an hour building LLVM and then leave PostgreSQL linked to the
+        # old runtime.
+        if llvm_config:
+            required_configure_flags.append(f"LLVM_CONFIG={llvm_config}")
     needs_rebuild = False
 
     if check_existing(install_path):
@@ -1346,8 +1411,6 @@ def build_postgresql(
 
     # LLVM/JIT support (resolved by caller)
     if with_llvm:
-        if llvm_config is None:
-            llvm_config = find_llvm_config()
         if llvm_config:
             # Record the exact toolchain in the build output: llvmjit.so will
             # link against this LLVM's runtime, and that dependency is invisible
@@ -1721,7 +1784,7 @@ _{script_name.replace("-", "_").replace(".", "_")}_completions() {{
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
     opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --build-llvm --no-alias --verbose --completions --help"
-    components="readline openssl icu postgresql contrib q3c ast pgast"
+    components="readline openssl icu llvm postgresql contrib q3c ast pgast"
 
     case "${{prev}}" in
         --config)
@@ -1761,7 +1824,7 @@ _pginstall() {{
     opts=(
         '--config[Config file for version pinning]:file:_files'
         '--dry-run[Show what would be done without executing]'
-        '--component[Build only specific component]:component:(readline openssl icu postgresql contrib q3c ast pgast)'
+        '--component[Build only specific component]:component:(readline openssl icu llvm postgresql contrib q3c ast pgast)'
         '--skip-extensions[Skip q3c, ast, and pgast extensions]'
         '--exclude-ast[Exclude Starlink AST library and pgast]'
         '--with-llvm[Enable LLVM/JIT support (opt-in on macOS, auto on Linux)]'
@@ -1871,10 +1934,17 @@ Shell completions:
     return parser.parse_args()
 
 
-def get_required_tools(exclude_ast: bool = False) -> list[str]:
+def get_required_tools(exclude_ast: bool = False,
+                       build_llvm: bool = False) -> list[str]:
     """Return list of required tools for the current platform."""
     tools = ["make", "gcc", "tar", "git", "bison", "flex"]
     plat = get_platform()
+
+    # LLVM is C++ and needs its own toolchain. The documented Linux
+    # prerequisites install a C compiler only, so a clean setup would otherwise
+    # fail partway into the cmake configure step.
+    if build_llvm:
+        tools.extend(["cmake", "ninja", "c++"])
 
     if plat == "darwin":
         tools.append("clang")
@@ -1923,9 +1993,10 @@ def find_pkg_config() -> Optional[str]:
     return shutil.which("pkg-config")
 
 
-def check_missing_tools(exclude_ast: bool = False) -> list[str]:
+def check_missing_tools(exclude_ast: bool = False,
+                        build_llvm: bool = False) -> list[str]:
     """Return list of missing required tools."""
-    required = get_required_tools(exclude_ast=exclude_ast)
+    required = get_required_tools(exclude_ast=exclude_ast, build_llvm=build_llvm)
     missing = []
     for tool in required:
         if tool == "patchelf":
@@ -2054,11 +2125,13 @@ def check_src_dir(dry_run: bool = False) -> bool:
         return False
 
 
-def check_prerequisites(dry_run: bool = False, exclude_ast: bool = False) -> list[str]:
+def check_prerequisites(dry_run: bool = False, exclude_ast: bool = False,
+                        build_llvm: bool = False) -> list[str]:
     """Check that required tools and libraries are available. Returns list of missing items."""
     print("Checking prerequisites...")
 
-    missing_tools = check_missing_tools(exclude_ast=exclude_ast)
+    missing_tools = check_missing_tools(exclude_ast=exclude_ast,
+                                        build_llvm=build_llvm)
     missing_libs = check_missing_libraries()
     missing = missing_tools + missing_libs
 
@@ -2134,7 +2207,9 @@ def main() -> None:
         print("\n*** DRY RUN MODE - No changes will be made ***")
 
     # Check prerequisites
-    missing_tools = check_prerequisites(dry_run=args.dry_run, exclude_ast=args.exclude_ast)
+    missing_tools = check_prerequisites(dry_run=args.dry_run,
+                                        exclude_ast=args.exclude_ast,
+                                        build_llvm=args.build_llvm)
 
     # In dry-run mode, show install commands for missing prerequisites
     if args.dry_run and missing_tools:
@@ -2185,31 +2260,33 @@ def main() -> None:
     building_pg = (args.component is None or args.component == "postgresql")
     use_llvm = False
     llvm_config = None
-    if building_pg:
+    if building_pg and args.build_llvm:
+        # Address the private build by its versioned path. --no-alias skips the
+        # /usr/local/llvm symlink, and find_llvm_config() would then miss the
+        # LLVM we just built and silently settle for a system one.
+        private = private_llvm_config(versions["llvm"])
+        if private.is_file() or args.dry_run:
+            llvm_config = str(private)
+            use_llvm = True
+        else:
+            print(f"\n  --build-llvm was given but {private} does not exist.",
+                  file=sys.stderr)
+            print("  Refusing to fall back to a system LLVM, which is the"
+                  " dependency --build-llvm exists to avoid.", file=sys.stderr)
+            sys.exit(1)
+    elif building_pg:
         llvm_config = find_llvm_config()
         if plat == "darwin":
             # macOS: opt-in only via --with-llvm flag
             if args.with_llvm:
-                if llvm_config or (args.build_llvm and args.dry_run):
+                if llvm_config:
                     use_llvm = True
-                    if not llvm_config:
-                        llvm_config = str(INSTALL_BASE / "llvm" / "bin" / "llvm-config")
                 else:
                     print("\n  --with-llvm specified but LLVM was not found.", file=sys.stderr)
                     print("  Build one with --build-llvm, or install LLVM yourself.",
                           file=sys.stderr)
                     if not args.dry_run:
                         sys.exit(1)
-        elif args.build_llvm:
-            # Just built it (or --dry-run said it would be). Nothing to prompt.
-            if llvm_config or args.dry_run:
-                use_llvm = True
-                if not llvm_config:
-                    llvm_config = str(INSTALL_BASE / "llvm" / "bin" / "llvm-config")
-            else:
-                print("\n  --build-llvm was given but no llvm-config was found"
-                      f" under {INSTALL_BASE / 'llvm'}.", file=sys.stderr)
-                sys.exit(1)
         else:
             # Linux: auto-detect, prompt if not found
             if llvm_config:
