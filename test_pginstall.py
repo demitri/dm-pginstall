@@ -62,7 +62,8 @@ def test_find_llvm_config_prefers_a_private_build(monkeypatched=None):
         saved = p.INSTALL_BASE
         p.INSTALL_BASE = base
         try:
-            check("private build wins", p.find_llvm_config(), str(private))
+            check("private build wins", p.find_llvm_config(),
+                  str(private.resolve()))
         finally:
             p.INSTALL_BASE = saved
 
@@ -192,6 +193,48 @@ def test_build_llvm_requires_a_cxx_toolchain():
     for tool in ("cmake", "ninja", "c++"):
         check(f"{tool} required with --build-llvm", tool in with_llvm, True)
         check(f"{tool} not required otherwise", tool in plain, False)
+
+
+def test_find_llvm_config_resolves_the_alias_to_a_versioned_path():
+    """PostgreSQL bakes this path into its rpath. Returning the mutable
+    /usr/local/llvm alias would mean repointing it at a newer LLVM breaks an
+    existing build -- the same "runtime moved underneath us" failure this
+    feature exists to prevent, self-inflicted."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        versioned = base / "llvm-23.1.0" / "bin"
+        versioned.mkdir(parents=True)
+        (versioned / "llvm-config").write_text("#!/bin/sh\n")
+        (versioned / "llvm-config").chmod(0o755)
+        (base / "llvm").symlink_to(base / "llvm-23.1.0")
+
+        saved = p.INSTALL_BASE
+        p.INSTALL_BASE = base
+        try:
+            got = p.find_llvm_config()
+            check("resolved to the versioned path", got,
+                  str((base / "llvm-23.1.0" / "bin" / "llvm-config").resolve()))
+            check("alias not returned", "/llvm/bin/" in got, False)
+        finally:
+            p.INSTALL_BASE = saved
+
+
+def test_prerequisite_commands_use_real_package_names():
+    """c++ and ninja are tool names, not packages. Falling through literally
+    produced install commands naming packages that do not exist."""
+    tools = ["cmake", "ninja", "c++"]
+
+    apt = p.get_package_names_for_tools(tools, "apt")
+    check("apt: ninja-build", "ninja-build" in apt, True)
+    check("apt: no literal ninja", "ninja" in apt, False)
+    # build-essential supplies g++ on Debian/Ubuntu.
+    check("apt: c++ covered", ("g++" in apt) or ("build-essential" in apt), True)
+    check("apt: no literal c++", "c++" in apt, False)
+
+    dnf = p.get_package_names_for_tools(tools, "dnf")
+    check("dnf: gcc-c++", "gcc-c++" in dnf, True)
+    check("dnf: ninja-build", "ninja-build" in dnf, True)
+    check("dnf: no literal c++", "c++" in dnf, False)
 
 
 # ---------------------------------------------------------------------------

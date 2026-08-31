@@ -178,8 +178,20 @@ runtime. Nothing the package manager does can touch it.
 ./pginstall.py --build-llvm --component llvm
 ```
 
-Once built, `/usr/local/llvm/bin/llvm-config` is preferred over any system LLVM
-automatically, so later PostgreSQL rebuilds keep using it with no extra flags.
+Once built, the private LLVM is preferred over any system LLVM automatically, so
+later PostgreSQL rebuilds keep using it with no extra flags. PostgreSQL records
+the *versioned* path (`/usr/local/llvm-<version>/lib`) in its rpath rather than
+the `/usr/local/llvm` alias, so building a newer LLVM later cannot break an
+existing installation.
+
+The newest stable LLVM is used by default, and PostgreSQL sometimes trails new
+LLVM majors by a release or two. Pin a known-good version in the config file if
+needed:
+
+```ini
+[versions]
+llvm = 20.1.8
+```
 
 > **This is a long build.** Expect roughly 30–90 minutes and several GB under
 > `/usr/local/src`. It needs `cmake`, `ninja`, and a C++ compiler. Only the host

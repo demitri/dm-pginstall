@@ -224,7 +224,16 @@ def find_llvm_config() -> Optional[str]:
     """
     # A private LLVM built by --build-llvm wins over anything the system
     # provides: it is the only one no package manager can retire.
-    candidates: list[str] = [str(INSTALL_BASE / "llvm" / "bin" / "llvm-config")]
+    #
+    # Resolved to its versioned target, never left as the /usr/local/llvm
+    # alias. PostgreSQL bakes this path into its rpath, so an aliased rpath
+    # would break an existing build the moment the symlink is repointed at a
+    # newer LLVM -- the same "the runtime moved underneath us" failure this
+    # whole feature exists to prevent, just self-inflicted.
+    private = INSTALL_BASE / "llvm" / "bin" / "llvm-config"
+    candidates: list[str] = []
+    if private.is_file():
+        candidates.append(str(private.resolve()))
 
     if get_platform() == "linux":
         # Versioned toolchains first, highest version wins. Compare as version
@@ -300,7 +309,8 @@ def get_llvm_install_command() -> Optional[str]:
     return None
 
 
-def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
+def offer_jit_protection(dry_run: bool, pg_config: Path,
+                         private_llvm: bool = False) -> None:
     """After a JIT-enabled build, offer to make the LLVM dependency visible to apt.
 
     llvmjit.so links against a specific versioned LLVM runtime that the package
@@ -313,6 +323,11 @@ def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
     pgjitguard defaults to the /usr/local/postgresql symlink, which --no-alias
     (or a declined symlink update) can leave pointing at an older installation —
     protecting that one would report success while leaving this build exposed.
+
+    private_llvm says the build links a privately built LLVM. There is then
+    nothing to protect, but a pin from before the switch may still be installed
+    and still depending on the old system runtime, which stops apt reclaiming
+    it. That cleanup must not depend on someone answering a prompt.
     """
     if get_platform() != "linux":
         return
@@ -320,11 +335,17 @@ def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
     print(f"\n{'=' * 60}")
     print("JIT dependency protection")
     print(f"{'=' * 60}")
-    print("\n  PostgreSQL was built with JIT support. llvmjit.so links against a")
-    print("  specific LLVM runtime that the package manager has no record of, so")
-    print("  a later LLVM upgrade can remove it. The server would still start and")
-    print("  cheap queries would still work; only queries above jit_above_cost")
-    print("  would fail.")
+    if private_llvm:
+        print("\n  PostgreSQL was built against a private LLVM under"
+              f" {INSTALL_BASE},")
+        print("  which no package manager owns. Nothing can remove it, so there")
+        print("  is nothing to protect.")
+    else:
+        print("\n  PostgreSQL was built with JIT support. llvmjit.so links against a")
+        print("  specific LLVM runtime that the package manager has no record of, so")
+        print("  a later LLVM upgrade can remove it. The server would still start and")
+        print("  cheap queries would still work; only queries above jit_above_cost")
+        print("  would fail.")
 
     guard = SCRIPT_DIR / "pgjitguard.py"
     if not guard.is_file():
@@ -350,6 +371,25 @@ def offer_jit_protection(dry_run: bool, pg_config: Path) -> None:
     # Ahead of the existence check: during a dry run of a new version the
     # versioned path legitimately does not exist yet, and the point of a dry
     # run is to show the plan rather than report the absence.
+    if private_llvm:
+        # Nothing to protect, so nothing to ask. Run the guard anyway: it is a
+        # no-op unless a pin survives from before the switch, in which case it
+        # removes the package still pinning the old system LLVM.
+        print("\n  Checking for a pin left over from before the switch:")
+        if dry_run:
+            print(f"\n  [dry-run] Would run: {protect_hint}")
+            return
+        if not pg_config.is_file():
+            print(f"\n  Expected pg_config at {pg_config}, but it is not there.")
+            print(f"  Skipping; run this once it exists:\n    {protect_hint}")
+            return
+        result = subprocess.run(protect_cmd)
+        if result.returncode != 0:
+            print(f"\n  pgjitguard exited {result.returncode}. To retry:",
+                  file=sys.stderr)
+            print(f"    {protect_hint}", file=sys.stderr)
+        return
+
     if dry_run:
         print(f"\n  [dry-run] Would offer to run: {protect_hint}")
         return
@@ -1198,6 +1238,10 @@ def build_llvm(
 
     print(f"\n  This is a large build: expect roughly 30-90 minutes and several")
     print(f"  GB of disk under {SRC_DIR}.")
+    print(f"\n  Note: this is the newest stable LLVM ({version}). PostgreSQL")
+    print("  usually trails new LLVM majors by a release or two. If the build")
+    print("  or JIT misbehaves, pin a known-good version in the config file:")
+    print("    [versions]\n    llvm = 20.1.8")
     print(f"  Compile jobs: {cpu_count}, link jobs: {link_jobs} (linking LLVM"
           " needs several GB each)")
 
@@ -1246,18 +1290,22 @@ def build_llvm(
         description="Installing LLVM...",
     )
 
+    # Validate before publishing the alias. Pointing /usr/local/llvm at a tree
+    # we are about to reject would leave the rejected build as the system's
+    # default LLVM.
+    if not dry_run and not llvm_install_is_complete(install_path):
+        print(f"Error: LLVM install finished but {install_path} is missing",
+              file=sys.stderr)
+        print("  llvm-config, clang, or the shared LLVM runtime.", file=sys.stderr)
+        print(f"  Leaving {symlink_path} untouched.", file=sys.stderr)
+        sys.exit(1)
+
     if not no_alias:
         create_symlink(install_path, symlink_path, dry_run)
 
     if not dry_run:
-        if not llvm_install_is_complete(install_path):
-            print(f"Error: LLVM install finished but {install_path} is missing",
-                  file=sys.stderr)
-            print("  llvm-config, clang, or the shared LLVM runtime.",
-                  file=sys.stderr)
-            sys.exit(1)
         print(f"\n  LLVM installed: {install_path}")
-        print(f"  PostgreSQL will use it automatically on the next build.")
+        print("  PostgreSQL will use it automatically on the next build.")
 
 
 def build_postgresql(
@@ -2050,6 +2098,10 @@ def get_package_names_for_tools(tools: list[str], pkg_mgr: str) -> list[str]:
         "patchelf": {"apt": "patchelf", "dnf": "patchelf", "yum": "patchelf", "pacman": "patchelf"},
         "clang": {"apt": "clang", "dnf": "clang", "yum": "clang", "pacman": "clang"},
         "gfortran": {"apt": "gfortran", "dnf": "gcc-gfortran", "yum": "gcc-gfortran", "pacman": "gcc-fortran"},
+        "cmake": {"apt": "cmake", "dnf": "cmake", "yum": "cmake", "pacman": "cmake"},
+        "ninja": {"apt": "ninja-build", "dnf": "ninja-build", "yum": "ninja-build", "pacman": "ninja"},
+        # LLVM is C++; the base prerequisites install a C compiler only.
+        "c++": {"apt": "g++", "dnf": "gcc-c++", "yum": "gcc-c++", "pacman": "gcc"},
         "libreadline-dev": {"apt": "libreadline-dev", "dnf": "readline-devel", "yum": "readline-devel", "pacman": "readline"},
         "zlib1g-dev": {"apt": "zlib1g-dev", "dnf": "zlib-devel", "yum": "zlib-devel", "pacman": "zlib"},
     }
@@ -2059,7 +2111,8 @@ def get_package_names_for_tools(tools: list[str], pkg_mgr: str) -> list[str]:
         packages = set()
         has_build_tools = False
         for tool in tools:
-            if tool in ("make", "gcc"):
+            if tool in ("make", "gcc", "c++"):
+                # build-essential provides all three on Debian/Ubuntu.
                 has_build_tools = True
             elif tool in tool_to_pkg:
                 packages.add(tool_to_pkg[tool].get(pkg_mgr, tool))
@@ -2386,7 +2439,10 @@ def main() -> None:
         pg_config = (
             INSTALL_BASE / f"postgresql-{versions['postgresql']}" / "bin" / "pg_config"
         )
-        offer_jit_protection(args.dry_run, pg_config)
+        # A private LLVM lives under INSTALL_BASE; a system one does not.
+        private_llvm = bool(llvm_config) and str(llvm_config).startswith(
+            str(INSTALL_BASE))
+        offer_jit_protection(args.dry_run, pg_config, private_llvm=private_llvm)
 
 
 if __name__ == "__main__":
