@@ -237,43 +237,37 @@ against a different LLVM it reports the old runtime as still protected and the
 new one as exposed, which is the state that would otherwise go unnoticed until
 the next upgrade. `check` warns about the same drift without failing.
 
-`protect` offers two enforcement methods:
+`protect` generates a small `.deb` whose `Depends:` are the packages owning
+`llvmjit.so`'s dependencies, and installs it. apt then models the dependency
+properly: removal is refused, an upgrade that would break it warns first,
+`autoremove` can never reap the runtime, and security updates still apply
+normally.
 
-| Method | How it works | Trade-off |
-|--------|--------------|-----------|
-| `depends` (default) | Generates a small `.deb` whose `Depends:` are **every** dpkg-owned dependency | apt models the dependency properly: removal refused, breaking upgrades warn, autoremove can't reap it, security updates still apply |
-| `hold` | `apt-mark manual` + `hold` on the **LLVM runtime** packages only | Nothing generated and reversible with `apt-mark`, but a hold blocks the held package's security updates |
-
-The scopes differ deliberately. Declaring a dependency costs nothing, so
-`depends` covers everything `llvmjit.so` links against. A hold has a real cost,
-so it covers only the LLVM runtime — the one dependency whose package name
-carries its version, meaning a successor arrives as a *separate* package and the
-old one gets retired. `libc6` and friends upgrade in place and are never
-withdrawn, so holding them would block their security updates to guard against
-something that cannot happen.
-
-`unprotect` restores apt's original state: packages it marked manual go back to
-automatic, and a package that was *already* held before `pgjitguard` ran is left
-held, since that is someone else's policy to revoke.
+> An earlier version also offered an `apt-mark hold` method. It was removed:
+> holding a package pins it at a fixed version, so it blocks that package's
+> security updates. Keeping known vulnerabilities on the system to protect a
+> JIT module is not a good trade, and the generated package achieves the same
+> protection without it.
 
 `pginstall.py` offers to run `protect` after any JIT-enabled build.
 
 **After rebuilding PostgreSQL against a newer LLVM**, re-run `sudo ./pgjitguard.py
-protect`. Either method re-derives the dependency set from the rebuilt module,
-protects the new runtime, and releases the old one — `apt autoremove` then
-reclaims it. There is nothing to unpin by hand.
+protect`. It re-derives the dependency set from the rebuilt module, protects the
+new runtime, and releases the old one — `apt autoremove` then reclaims it. There
+is nothing to unpin by hand.
 
 Options:
 - `--pg-config PATH` - Use a specific `pg_config` (default: `/usr/local/postgresql/bin`, then PATH)
-- `-m`, `--method` - `depends` or `hold` (default: ask)
 - `--live` - `check` also runs a query that forces JIT compilation
 - `--hook` - `check` warns loudly but always exits 0 (used by the apt hook)
 - `--dry-run` - Show what would be done without executing
 
 `protect` refuses to run against a module whose dependencies are already
 unresolved — doing so would record the wrong set. Rebuild first, then protect.
-Switching methods removes the one it replaces, so a superseded `hold` cannot go
-on silently blocking security updates.
+
+If no dpkg package owns the LLVM runtime — the case after
+[`--build-llvm`](#building-a-private-llvm) — every command reports that there is
+nothing to protect, because no apt operation can remove it.
 
 > **Scope**: this guards one installation at a time — the one `--pg-config`
 > names, defaulting to the `/usr/local/postgresql` symlink. The generated

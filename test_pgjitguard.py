@@ -59,6 +59,14 @@ class FakeState:
         self.module = Path(module)
         self.pg_config = Path(pg_config)
 
+    @property
+    def is_at_risk(self):
+        return bool(self.llvm_packages)
+
+    @property
+    def llvm_provider(self):
+        return "/usr/local/llvm-21.1.0/lib/libLLVM.so.21.1"
+
 
 failures = []
 checks = 0
@@ -129,8 +137,7 @@ def test_resolve_deps_on_healthy_module():
 
 def test_pin_covering_current_packages_is_protected():
     restore = stub(installed_pin_version=lambda: "1.2",
-                   installed_pin_depends=lambda: ["libllvm21", "libc6"],
-                   read_hold_manifest=lambda: {})
+                   installed_pin_depends=lambda: ["libllvm21", "libc6"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
         check("protected by depends", by, ["dependency package"])
@@ -143,8 +150,7 @@ def test_pin_left_behind_by_rebuild_is_a_gap():
     # The regression codex caught: a pin exists, so the old code reported
     # "protected" -- but it still guards libllvm20 after a rebuild onto 21.
     restore = stub(installed_pin_version=lambda: "1.2",
-                   installed_pin_depends=lambda: ["libllvm20", "libc6"],
-                   read_hold_manifest=lambda: {})
+                   installed_pin_depends=lambda: ["libllvm20", "libc6"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
         check("not counted as protected", by, [])
@@ -154,34 +160,8 @@ def test_pin_left_behind_by_rebuild_is_a_gap():
         restore()
 
 
-def test_hold_dropped_outside_the_tool_is_a_gap():
-    restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)},
-                   currently_held=lambda: ["libc6"])
-    try:
-        by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
-        check("not protected", by, [])
-        check("both drop and coverage reported", gaps,
-              ["recorded holds no longer applied: libllvm21",
-               "not held: libllvm21"])
-    finally:
-        restore()
-
-
-def test_hold_covering_current_packages_is_protected():
-    restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)},
-                   currently_held=lambda: ["libc6", "libllvm21"])
-    try:
-        by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
-        check("protected by hold", by, ["apt-mark hold"])
-        check("no gaps", gaps, [])
-    finally:
-        restore()
-
-
 def test_no_protection_at_all():
-    restore = stub(installed_pin_version=lambda: None, read_hold_manifest=lambda: {})
+    restore = stub(installed_pin_version=lambda: None)
     try:
         by, gaps = g.protection_gaps(FakeState(["libllvm21"]))
         check("nothing protecting", (by, gaps), ([], []))
@@ -189,59 +169,30 @@ def test_no_protection_at_all():
         restore()
 
 
-# ---------------------------------------------------------------------------
-# Method transitions
-# ---------------------------------------------------------------------------
-
-def test_has_protection_detects_each_method():
-    restore = stub(installed_pin_version=lambda: "1.1", read_hold_manifest=lambda: {})
+def test_private_llvm_needs_no_protection():
+    """After --build-llvm the runtime lives under /usr/local and no dpkg package
+    owns it, so apt cannot retire it. That must read as "nothing to protect",
+    not as an unprotected gap to nag about."""
+    state = FakeState(["libc6", "libstdc++6"], llvm_packages=[])
+    check("not at risk", state.is_at_risk, False)
+    restore = stub(installed_pin_version=lambda: None)
     try:
-        check("depends present", g.has_protection(g.Method.DEPENDS), True)
-        check("hold absent", g.has_protection(g.Method.HOLD), False)
+        check("no gaps reported", g.protection_gaps(state), ([], []))
+    finally:
+        restore()
+    # Even with a stale pin installed, there is nothing at risk to report.
+    restore = stub(installed_pin_version=lambda: "1.2",
+                   installed_pin_depends=lambda: ["libllvm20"])
+    try:
+        check("stale pin irrelevant when nothing is at risk",
+              g.protection_gaps(state), ([], []))
     finally:
         restore()
 
-    restore = stub(installed_pin_version=lambda: None,
-                   read_hold_manifest=lambda: {"libllvm21": g.HoldRecord(True, False)})
-    try:
-        check("depends absent", g.has_protection(g.Method.DEPENDS), False)
-        check("hold present", g.has_protection(g.Method.HOLD), True)
-    finally:
-        restore()
 
-
-# ---------------------------------------------------------------------------
-# Hold manifest: the auto/manual marking must survive a round-trip
-# ---------------------------------------------------------------------------
-
-def test_hold_manifest_roundtrip_preserves_auto_flags():
-    with tempfile.TemporaryDirectory() as tmp:
-        manifest = Path(tmp) / "held-packages.txt"
-        restore = stub(HOLD_MANIFEST=manifest)
-        try:
-            original = {
-                "libllvm21": g.HoldRecord(was_auto=True, was_held=False),
-                "libc6": g.HoldRecord(was_auto=False, was_held=True),
-            }
-            g.write_hold_manifest(original, FakeState(["libllvm21", "libc6"]))
-            check("roundtrip", g.read_hold_manifest(), original)
-            back = g.read_hold_manifest()
-            # Only the auto ones may be handed back to apt's autoremove.
-            check("only auto restored",
-                  sorted(p for p, r in back.items() if r.was_auto), ["libllvm21"])
-            # A package already held before we ran is someone else's policy.
-            check("pre-existing hold not ours",
-                  sorted(p for p, r in back.items() if r.was_held), ["libc6"])
-        finally:
-            restore()
-
-
-def test_missing_hold_manifest_reads_as_empty():
-    restore = stub(HOLD_MANIFEST=Path("/nonexistent/pgjitguard/held.txt"))
-    try:
-        check("absent manifest", g.read_hold_manifest(), {})
-    finally:
-        restore()
+def test_system_llvm_is_still_at_risk():
+    check("dpkg-owned LLVM is at risk",
+          FakeState(["libc6", "libllvm21"]).is_at_risk, True)
 
 
 # ---------------------------------------------------------------------------
@@ -326,33 +277,6 @@ def test_apt_hook_command_actually_parses():
           "/usr/local/postgresql-18.1/bin/pg_config")
 
 
-def test_release_leaves_pre_existing_holds_alone():
-    """A hold that predates pgjitguard is someone else's policy; unholding it
-    on unprotect would silently revoke an unrelated decision."""
-    calls = []
-
-    def fake_run(cmd, check=True):
-        calls.append(cmd)
-        return 0, "", ""
-
-    restore = stub(run=fake_run)
-    try:
-        ours, theirs = g.release_hold_packages({
-            "libllvm21": g.HoldRecord(was_auto=True, was_held=False),
-            "libc6": g.HoldRecord(was_auto=False, was_held=True),
-        })
-        check("only ours released", ours, ["libllvm21"])
-        check("theirs reported back", theirs, ["libc6"])
-        check("unhold excludes the pre-existing hold",
-              [c for c in calls if c[:2] == ["apt-mark", "unhold"]],
-              [["apt-mark", "unhold", "libllvm21"]])
-        check("auto restored only where it was auto",
-              [c for c in calls if c[:2] == ["apt-mark", "auto"]],
-              [["apt-mark", "auto", "libllvm21"]])
-    finally:
-        restore()
-
-
 def test_jitstate_separates_llvm_packages_from_the_rest():
     """Hold mode is scoped to the LLVM runtime: holding libc6 would block its
     security updates to guard against a retirement that never happens."""
@@ -377,8 +301,8 @@ def test_jitstate_separates_llvm_packages_from_the_rest():
         state = g.JitState(Path("/usr/local/postgresql-18.1/bin/pg_config"))
         check("depends covers every dpkg-owned dep", state.packages,
               ["libc6", "libllvm21", "libstdc++6"])
-        check("hold scope is the LLVM runtime only", state.llvm_packages,
-              ["libllvm21"])
+        check("LLVM runtime identified", state.llvm_packages, ["libllvm21"])
+        check("system LLVM is at risk", state.is_at_risk, True)
         check("nothing unresolved", state.missing, [])
     finally:
         restore()
@@ -390,10 +314,18 @@ def test_remediation_command_names_the_installation():
     saved = sys.argv
     sys.argv = ["/usr/local/sbin/pgjitguard"]
     try:
-        check("remediation carries --pg-config",
+        check("absolute path, carries --pg-config",
               g.remediation_command(FakeState(["libllvm21"])),
-              "sudo pgjitguard --pg-config "
+              "sudo /usr/local/sbin/pgjitguard --pg-config "
               "/usr/local/postgresql-18.1/bin/pg_config protect")
+        # './pgjitguard.py' must not be suggested as bare 'pgjitguard.py':
+        # sudo's PATH does not include the current directory.
+        check("relative invocation is resolved",
+              "sudo ./" not in g.remediation_command(FakeState(["libllvm21"])), True)
+        # A pg_config path containing a space must survive as one argument.
+        spaced = FakeState(["libllvm21"], pg_config="/opt/my pg/bin/pg_config")
+        check("spaced path is quoted",
+              "'/opt/my pg/bin/pg_config'" in g.remediation_command(spaced), True)
     finally:
         sys.argv = saved
 

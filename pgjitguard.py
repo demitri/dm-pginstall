@@ -9,40 +9,37 @@ that retires the old LLVM will silently break JIT: the module is loaded lazily,
 so the server starts cleanly and only queries above jit_above_cost fail.
 
 This tool closes that gap. It reads llvmjit.so's own DT_NEEDED entries, asks
-dpkg which packages own them, and then enforces that dependency by one of two
-methods:
+dpkg which packages own them, and generates a small .deb whose Depends are those
+packages. apt then models the dependency properly: removal is refused, an
+upgrade that would break it warns first, autoremove can never reap the runtime,
+and security updates still apply normally.
 
-  depends  Generate a small .deb whose Depends are those packages. apt models
-           the dependency properly: removal is refused, upgrades warn, and
-           autoremove can never reap the runtime. Covers every dpkg-owned
-           dependency, since declaring one costs nothing.
-  hold     Mark the LLVM runtime packages manual and held with apt-mark.
-           Nothing is generated, but a hold blocks the package's security
-           updates, so it is scoped to the runtime actually at risk of
-           retirement rather than to every library llvmjit.so needs.
+The dependency set is derived from the binary, never hand-written. Rebuilt
+PostgreSQL against a newer LLVM? Re-run "protect". The new runtime is protected
+and the old one is released, so "apt autoremove" reclaims it.
 
-Either way the dependency set is derived from the binary, never hand-written.
-Rebuilt PostgreSQL against a newer LLVM? Re-run "protect". The new runtime is
-protected and the old one is released, so "apt autoremove" reclaims it.
+The stronger option is not to depend on the system LLVM at all: "pginstall.py
+--build-llvm" builds a private LLVM under /usr/local and links PostgreSQL
+against it, putting the runtime outside apt's reach entirely. This tool then
+reports that there is nothing left to protect.
 
 Scope: this guards one installation at a time -- the one --pg-config names,
-defaulting to /usr/local/postgresql. The generated package and the manifests use
-fixed names, so protecting a second installation replaces the first rather than
-adding to it. With side-by-side PostgreSQL versions, protect the one whose JIT
-you rely on, or build them against the same LLVM.
+defaulting to /usr/local/postgresql. The generated package uses a fixed name, so
+protecting a second installation replaces the first rather than adding to it.
+With side-by-side PostgreSQL versions, protect the one whose JIT you rely on, or
+build them against the same LLVM.
 
 Usage:
     pgjitguard.py                    # Show JIT dependency status
     pgjitguard.py status             # Show JIT dependency status
     pgjitguard.py check              # Exit non-zero if JIT is broken
-    pgjitguard.py protect            # Enforce the dependency (asks how)
+    pgjitguard.py protect            # Declare the dependency to apt
     pgjitguard.py unprotect          # Remove the protection
     pgjitguard.py install-hook       # Run "check" after every apt transaction
     pgjitguard.py uninstall-hook     # Remove the apt hook
 
 Options:
     --pg-config PATH   Use a specific pg_config (default: search PATH)
-    --method NAME      depends | hold (default: ask)
     --live             "check" also runs a query that forces JIT compilation
     --hook             "check" warns loudly but always exits 0 (for apt)
     --quiet            Suppress output when everything is fine
@@ -53,13 +50,12 @@ import argparse
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -67,12 +63,9 @@ from typing import Optional
 PG_BASE = Path("/usr/local/postgresql")
 PG_BIN = PG_BASE / "bin"
 
-# Generated dependency package (Method.DEPENDS)
+# Generated dependency package
 PIN_PACKAGE = "postgresql-jit-llvm-pin"
 PIN_MANIFEST = Path("/usr/share/pgjitguard/pin-manifest.txt")
-
-# Record of what we told apt-mark to hold (Method.HOLD)
-HOLD_MANIFEST = Path("/var/lib/pgjitguard/held-packages.txt")
 
 # apt integration
 APT_HOOK_FILE = Path("/etc/apt/apt.conf.d/99-pgjitguard")
@@ -84,14 +77,6 @@ EXIT_BROKEN = 1
 EXIT_ERROR = 2
 
 
-class Method(Enum):
-    """How the JIT module's hidden dependency is enforced against apt."""
-
-    DEPENDS = "depends"  # generate a .deb that Depends on the runtime packages
-    HOLD = "hold"        # apt-mark manual + hold on the runtime packages
-
-    def __str__(self) -> str:
-        return self.value
 
 
 def run(cmd: list[str], check: bool = True) -> tuple[int, str, str]:
@@ -288,12 +273,29 @@ class JitState:
         return bool(self.missing)
 
     @property
+    def is_at_risk(self) -> bool:
+        """True if an apt operation could remove the LLVM this module needs.
+
+        False when no dpkg package owns the LLVM runtime -- the case after
+        'pginstall.py --build-llvm', where LLVM lives under /usr/local and apt
+        has no say over it. That is the desired end state, not a failure.
+        """
+        return bool(self.llvm_packages)
+
+    @property
+    def llvm_provider(self) -> str:
+        """Where the LLVM runtime actually comes from, for reporting."""
+        paths = [self.resolved.get(s) for s in self.llvm_sonames]
+        paths = [p for p in paths if p]
+        return ", ".join(paths) if paths else "unknown"
+
+    @property
     def llvm_sonames(self) -> list[str]:
         return [s for s in self.needed if "LLVM" in s]
 
 
 # --------------------------------------------------------------------------
-# Method.DEPENDS - a generated package that declares the dependency
+# The generated package that declares the dependency
 # --------------------------------------------------------------------------
 
 
@@ -409,14 +411,14 @@ def apply_depends(state: JitState, dry_run: bool) -> int:
     version = next_pin_version()
     current = installed_pin_version()
 
-    print(f"Method:      dependency package ({PIN_PACKAGE} {version})"
+    print(f"Package:     {PIN_PACKAGE} {version}"
           + (f", replacing {current}" if current else ""))
 
     if dry_run:
         print("\n[dry-run] Would build and install the package above.")
         return EXIT_OK
 
-    require_root("protect --method depends")
+    require_root("protect")
 
     with tempfile.TemporaryDirectory(prefix="pgjitguard-") as tmp:
         deb = build_pin_package(state, version, Path(tmp))
@@ -448,210 +450,17 @@ def remove_depends(dry_run: bool) -> int:
     return EXIT_OK
 
 
-# --------------------------------------------------------------------------
-# Method.HOLD - apt-mark manual + hold on the runtime packages
-# --------------------------------------------------------------------------
 
 
-@dataclass
-class HoldRecord:
-    """How apt had a package marked before pgjitguard touched it.
-
-    Both flags are needed to undo cleanly. was_auto says whether restoring
-    'auto' is required for autoremove to reclaim the package; was_held says
-    whether the hold was already someone else's policy, in which case
-    pgjitguard must leave it alone rather than quietly revoking it.
-    """
-
-    was_auto: bool
-    was_held: bool
 
 
-def read_hold_manifest() -> dict[str, HoldRecord]:
-    """Return {package: HoldRecord} for the packages we previously held."""
-    if not HOLD_MANIFEST.is_file():
-        return {}
-    recorded: dict[str, HoldRecord] = {}
-    for line in HOLD_MANIFEST.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) != 3:
-            # Loud rather than silent: a manifest we cannot parse means we no
-            # longer know what is safe to undo.
-            print(f"Error: malformed line in {HOLD_MANIFEST}: {line!r}",
-                  file=sys.stderr)
-            sys.exit(EXIT_ERROR)
-        name, auto_flag, held_flag = (f.strip() for f in fields)
-        recorded[name] = HoldRecord(was_auto=auto_flag == "auto",
-                                    was_held=held_flag == "held")
-    return recorded
 
 
-def write_hold_manifest(records: dict[str, HoldRecord], state: JitState) -> None:
-    """Record which packages we hold and how apt had them marked before."""
-    HOLD_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    lines = [
-        "# Generated by pgjitguard.py -- do not edit.",
-        "# Packages held on behalf of the PostgreSQL JIT module.",
-        "# Each line is: <package>\\t<auto|manual>\\t<held|unheld>, recording how",
-        "# apt had the package marked before pgjitguard touched it. A package",
-        "# recorded as 'held' was already held by someone else and is left alone.",
-        f"# generated: {stamp}",
-        f"# module:    {state.module}",
-        "",
-    ]
-    for package in sorted(records):
-        record = records[package]
-        lines.append(f"{package}\t{'auto' if record.was_auto else 'manual'}"
-                     f"\t{'held' if record.was_held else 'unheld'}")
-    HOLD_MANIFEST.write_text("\n".join(lines) + "\n")
 
 
-def currently_held() -> list[str]:
-    """Return every package apt currently has on hold."""
-    if not shutil.which("apt-mark"):
-        return []
-    returncode, out, _ = run(["apt-mark", "showhold"], check=False)
-    if returncode != 0:
-        return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def currently_auto() -> set[str]:
-    """Return every package apt considers automatically installed."""
-    if not shutil.which("apt-mark"):
-        return set()
-    returncode, out, _ = run(["apt-mark", "showauto"], check=False)
-    if returncode != 0:
-        return set()
-    return {line.strip() for line in out.splitlines() if line.strip()}
 
-
-def release_hold_packages(records: dict[str, HoldRecord]) -> tuple[list[str], list[str]]:
-    """Undo our apt-mark changes. Returns (unheld, left_held_for_someone_else)."""
-    if not records:
-        return [], []
-
-    # A package that was already held before we ran is someone else's policy.
-    # Unholding it would silently revoke an unrelated decision.
-    ours = sorted(name for name, r in records.items() if not r.was_held)
-    theirs = sorted(name for name, r in records.items() if r.was_held)
-    if ours:
-        run(["apt-mark", "unhold"] + ours)
-
-    # Restoring 'auto' is what actually lets apt autoremove reclaim a runtime we
-    # no longer need; unholding alone would leave it manual and pinned forever.
-    restore_auto = sorted(name for name, r in records.items() if r.was_auto)
-    if restore_auto:
-        run(["apt-mark", "auto"] + restore_auto)
-
-    return ours, theirs
-
-
-def apply_hold(state: JitState, dry_run: bool) -> int:
-    """Hold the LLVM runtime packages the JIT module depends on."""
-    require_tool("apt-mark", "apt")
-
-    targets = state.llvm_packages
-    if not targets:
-        print("Error: no dpkg-owned LLVM runtime among llvmjit.so's dependencies.",
-              file=sys.stderr)
-        print("  There is nothing for a hold to protect. If LLVM was itself built",
-              file=sys.stderr)
-        print("  from source it is already outside apt's reach; use --method",
-              file=sys.stderr)
-        print("  depends to declare the remaining packages.", file=sys.stderr)
-        return EXIT_ERROR
-
-    previous = read_hold_manifest()
-    stale = {p: r for p, r in previous.items() if p not in targets}
-    # Unlike the dependency package, a hold has a real cost: it blocks the
-    # package's security updates. Scope it to the runtime that is actually at
-    # risk of retirement rather than every library llvmjit.so happens to need.
-    excluded = [p for p in state.packages if p not in targets]
-
-    print("Method:      apt-mark hold")
-    print(f"  hold:      {', '.join(targets)}")
-    if excluded:
-        print(f"  not held:  {', '.join(excluded)}")
-        print("             (upgraded in place, never retired; holding them would")
-        print("              block their security updates for no benefit)")
-    if stale:
-        print(f"  release:   {', '.join(sorted(stale))}  (no longer needed by llvmjit.so)")
-
-    if dry_run:
-        print("\n[dry-run] Would apply the apt-mark changes above.")
-        return EXIT_OK
-
-    require_root("protect --method hold")
-
-    # Capture apt's current marking before changing it, so unprotect can put it
-    # back exactly as it was.
-    auto_now = currently_auto()
-    held_now = currently_held()
-    records = {p: HoldRecord(was_auto=p in auto_now, was_held=p in held_now)
-               for p in targets}
-    # Carry forward the original marking for anything already recorded: what it
-    # was before we first touched it is the state worth restoring, not the
-    # 'manual' and 'held' we ourselves imposed on the previous run.
-    for package, original in previous.items():
-        if package in records:
-            records[package] = original
-
-    # manual: stops autoremove reaping it once the distro default moves on.
-    # hold:   stops an upgrade or removal replacing it out from under us.
-    run(["apt-mark", "manual"] + targets)
-    run(["apt-mark", "hold"] + targets)
-    if stale:
-        release_hold_packages(stale)
-    write_hold_manifest(records, state)
-
-    print(f"\nProtected. apt will not remove or upgrade: {', '.join(targets)}")
-    if stale:
-        print(f"Released: {', '.join(sorted(stale))}")
-        print("Anything no longer needed is now reclaimable:")
-        print("  sudo apt autoremove")
-    print("\nNote: a hold also blocks security updates for the held packages.")
-    print("Review them when you next rebuild PostgreSQL.")
-    return EXIT_OK
-
-
-def remove_hold(dry_run: bool) -> int:
-    """Release the holds this tool applied, restoring apt's original marking."""
-    records = read_hold_manifest()
-    if not records:
-        print("  No apt-mark holds recorded by pgjitguard.")
-        return EXIT_OK
-
-    ours = sorted(p for p, r in records.items() if not r.was_held)
-    theirs = sorted(p for p, r in records.items() if r.was_held)
-    restore = sorted(p for p, r in records.items() if r.was_auto)
-
-    if dry_run:
-        if ours:
-            print(f"  [dry-run] Would unhold: {', '.join(ours)}")
-        if theirs:
-            print(f"  [dry-run] Would leave held (held before pgjitguard ran): "
-                  f"{', '.join(theirs)}")
-        if restore:
-            print(f"  [dry-run] Would restore to auto: {', '.join(restore)}")
-        return EXIT_OK
-
-    require_root("unprotect")
-    require_tool("apt-mark", "apt")
-    unheld, left = release_hold_packages(records)
-    HOLD_MANIFEST.unlink(missing_ok=True)
-
-    if unheld:
-        print(f"  Released holds: {', '.join(unheld)}")
-    if left:
-        print(f"  Left held (already held before pgjitguard ran): {', '.join(left)}")
-    if restore:
-        print(f"  Restored to automatically-installed: {', '.join(restore)}")
-    return EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -665,28 +474,35 @@ def remediation_command(state: JitState, action: str = "protect") -> str:
     Every "re-run this" message must carry --pg-config. Telling the user to run
     a bare 'pgjitguard protect' sends them back to the default symlink, which is
     the exact class of bug this tool guards against.
+
+    The path is absolute and the arguments quoted so the suggestion can be
+    pasted as-is: the documented invocation is './pgjitguard.py', and 'sudo
+    pgjitguard.py' would not resolve, since sudo's PATH excludes the current
+    directory.
     """
-    return (f"sudo {Path(sys.argv[0]).name} "
-            f"--pg-config {state.pg_config} {action}")
+    return "sudo " + shlex.join(
+        [str(Path(sys.argv[0]).resolve()), "--pg-config", str(state.pg_config),
+         action]
+    )
 
 
-def has_protection(method: Method) -> bool:
-    """Return True if the given enforcement method is currently in place."""
-    if method is Method.DEPENDS:
-        return installed_pin_version() is not None
-    return bool(read_hold_manifest())
 
 
 def protection_gaps(state: JitState) -> tuple[list[str], list[str]]:
     """Compare what is actually enforced against what the module needs now.
 
-    Returns (methods_fully_protecting, gaps). Presence of a pin or a hold
-    manifest is NOT protection: after a rebuild against a newer LLVM they still
-    guard the *previous* runtime, so the dependency set must be compared, not
-    merely found. This is the drift the tool exists to catch.
+    Returns (what_is_protecting, gaps). The mere presence of the pin package is
+    NOT protection: after a rebuild against a newer LLVM it still guards the
+    *previous* runtime, so the dependency set must be compared, not merely
+    found. This is the drift the tool exists to catch.
     """
     protected_by: list[str] = []
     gaps: list[str] = []
+
+    if not state.is_at_risk:
+        # A privately built LLVM is outside apt's reach. Reporting a "gap" here
+        # would nag about protection that is neither possible nor needed.
+        return protected_by, gaps
 
     if installed_pin_version():
         depends = installed_pin_depends()
@@ -696,56 +512,9 @@ def protection_gaps(state: JitState) -> tuple[list[str], list[str]]:
         else:
             protected_by.append("dependency package")
 
-    recorded = read_hold_manifest()
-    if recorded:
-        held = currently_held()
-        dropped = [p for p in recorded if p not in held]
-        # Hold mode is scoped to the LLVM runtime, so that is what it must cover.
-        uncovered = [p for p in state.llvm_packages if p not in held]
-        if dropped:
-            gaps.append(f"recorded holds no longer applied: {', '.join(sorted(dropped))}")
-        if uncovered:
-            gaps.append(f"not held: {', '.join(uncovered)}")
-        if not dropped and not uncovered:
-            protected_by.append("apt-mark hold")
-
     return protected_by, gaps
 
 
-def prompt_method(state: JitState) -> Optional[Method]:
-    """Ask which enforcement method to use. Returns None if the user declines."""
-    print("\nHow should apt be prevented from removing these packages?")
-    print()
-    print("  1) Dependency package  (recommended)")
-    print("     Generates a small .deb that Depends on them, so apt models the")
-    print("     dependency properly: removal is refused, an upgrade that would")
-    print("     break it warns first, and autoremove can never reap it. Security")
-    print("     updates still apply normally.")
-    print()
-    print("  2) apt-mark hold")
-    print(f"     Marks the LLVM runtime manual and held"
-          f"{' (' + ', '.join(state.llvm_packages) + ')' if state.llvm_packages else ''}.")
-    print("     Nothing is generated and it is reversible with apt-mark, but a hold")
-    print("     blocks security updates for what it holds, so it covers only the")
-    print("     runtime at risk of retirement -- not every library llvmjit.so needs.")
-    print("     Other tooling will report the held packages as kept back.")
-    print()
-    print("  3) Neither - just report status from now on")
-    print()
-
-    while True:
-        try:
-            choice = input("  Choice [1]: ").strip() or "1"
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if choice == "1":
-            return Method.DEPENDS
-        if choice == "2":
-            return Method.HOLD
-        if choice == "3":
-            return None
-        print("  Enter 1, 2, or 3.")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -783,12 +552,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print("  dependency package: not installed")
 
-    recorded = read_hold_manifest()
-    if recorded:
-        print(f"  apt-mark hold:      {', '.join(sorted(recorded))}")
-    else:
-        print("  apt-mark hold:      none recorded")
-
     print(f"  apt hook:           "
           f"{'installed' if APT_HOOK_FILE.is_file() else 'not installed'}"
           f" ({APT_HOOK_FILE})")
@@ -804,7 +567,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("\n  This is what a rebuild against a different LLVM looks like: the")
         print("  old runtime is still protected while the new one is exposed.")
         print(f"  Re-run: {remediation_command(state)}")
-    elif not protected_by:
+    elif not state.is_at_risk:
+        print("\n  Nothing to protect: no dpkg package owns the LLVM runtime")
+        print(f"  ({state.llvm_provider}), so an apt upgrade cannot remove it.")
+    else:
         print("\n  Nothing is protecting these packages. An LLVM upgrade can still")
         print(f"  break JIT. Run: {remediation_command(state)}")
 
@@ -927,16 +693,16 @@ def cmd_protect(args: argparse.Namespace) -> int:
         print("  against the installed LLVM first, then re-run protect.", file=sys.stderr)
         return EXIT_ERROR
 
-    if not state.packages:
-        print("Error: none of llvmjit.so's dependencies are owned by dpkg packages.",
-              file=sys.stderr)
-        print("  There is nothing for apt to protect. If LLVM was itself built from",
-              file=sys.stderr)
-        print("  source, it is already outside the package manager's reach.",
-              file=sys.stderr)
-        for entry in state.untracked:
-            print(f"  untracked: {entry}", file=sys.stderr)
-        return EXIT_ERROR
+    if not state.is_at_risk:
+        # Not an error: this is what a private LLVM looks like. apt does not own
+        # the runtime, so no apt operation can retire it, and a pin declaring
+        # libc6 would protect nothing that was ever in danger.
+        print(f"JIT module:  {state.module}")
+        print(f"LLVM:        {state.llvm_provider}")
+        print("\nNothing to protect: no dpkg package owns the LLVM runtime, so an")
+        print("apt upgrade cannot remove it. This is the outcome that")
+        print("'pginstall.py --build-llvm' is for.")
+        return EXIT_OK
 
     print(f"JIT module:  {state.module}")
     print(f"Depends on:  {', '.join(state.packages)}")
@@ -945,39 +711,8 @@ def cmd_protect(args: argparse.Namespace) -> int:
         for entry in state.untracked:
             print(f"  {entry}")
 
-    method = args.method
-    if method is None:
-        if not sys.stdin.isatty():
-            print("\nError: no --method given and stdin is not a terminal.",
-                  file=sys.stderr)
-            print("  Pass --method depends or --method hold.", file=sys.stderr)
-            return EXIT_ERROR
-        method = prompt_method(state)
-        if method is None:
-            print("\nNo protection applied. Status and check still work; re-run")
-            print(f"'{remediation_command(state)}' to change your mind.")
-            return EXIT_OK
-        print()
-
-    if method is Method.DEPENDS:
-        result = apply_depends(state, args.dry_run)
-        superseded, remove_superseded = Method.HOLD, remove_hold
-    else:
-        result = apply_hold(state, args.dry_run)
-        superseded, remove_superseded = Method.DEPENDS, remove_depends
-
-    if result != EXIT_OK:
-        return result
-
-    # Applying one method does not disable the other. A leftover hold keeps
-    # blocking security updates; a leftover package keeps pinning a runtime we
-    # no longer build against. Remove it only once the new protection is in
-    # place, so there is no unprotected window.
-    if has_protection(superseded):
-        print(f"\nRemoving superseded '{superseded}' protection:")
-        remove_superseded(args.dry_run)
-
-    return EXIT_OK
+    print()
+    return apply_depends(state, args.dry_run)
 
 
 def cmd_unprotect(args: argparse.Namespace) -> int:
@@ -986,10 +721,7 @@ def cmd_unprotect(args: argparse.Namespace) -> int:
     require_dpkg()
 
     print("Removing protection:")
-    if args.method in (None, Method.DEPENDS):
-        remove_depends(args.dry_run)
-    if args.method in (None, Method.HOLD):
-        remove_hold(args.dry_run)
+    remove_depends(args.dry_run)
 
     if not args.dry_run:
         print("\nThe LLVM runtime is no longer protected. It becomes autoremovable")
@@ -1116,15 +848,8 @@ the new runtime, and releases the old one for "apt autoremove" to reclaim.
     check.add_argument("--hook", action="store_true",
                        help="Warn loudly but always exit 0 (for use in the apt hook)")
 
-    protect = subparsers.add_parser("protect",
-                                    help="Enforce the dependency against apt")
-    protect.add_argument("-m", "--method", type=Method, choices=list(Method),
-                         help="depends (generated package) or hold (apt-mark); "
-                              "default: ask")
-
-    unprotect = subparsers.add_parser("unprotect", help="Remove the protection")
-    unprotect.add_argument("-m", "--method", type=Method, choices=list(Method),
-                           help="Remove only this method's protection (default: both)")
+    subparsers.add_parser("protect", help="Declare the dependency to apt")
+    subparsers.add_parser("unprotect", help="Remove the protection")
 
     subparsers.add_parser("install-hook",
                           help="Run the check after every apt transaction")
@@ -1135,7 +860,7 @@ the new runtime, and releases the old one for "apt autoremove" to reclaim.
     if not args.command:
         args.command = "status"
     # Defaults for options that exist only on some subparsers.
-    for option in ("live", "dbname", "hook", "method"):
+    for option in ("live", "dbname", "hook"):
         if not hasattr(args, option):
             setattr(args, option, None)
     return args
