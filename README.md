@@ -14,7 +14,7 @@ A Python-based installer that automates building PostgreSQL and its dependencies
 
 ```bash
 # Install prerequisites (Debian/Ubuntu)
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev patchelf git
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev patchelf git
 
 # Create source directory (one-time setup)
 sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
@@ -33,7 +33,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 | Component | Description | Install Path |
 |-----------|-------------|--------------|
 | ICU | International Components for Unicode | `/usr/local/icu-x.y` |
-| OpenSSL | Cryptographic library (required by pgcrypto) | `/usr/local/openssl-x.y.z` |
+| OpenSSL | Cryptographic library (required by pgcrypto); macOS only — Linux uses system `libssl-dev` | `/usr/local/openssl-x.y.z` |
 | LLVM | LLVM + clang for JIT (only with `--build-llvm`) | `/usr/local/llvm-x.y.z` |
 | PostgreSQL | PostgreSQL database server | `/usr/local/postgresql-x.y` |
 | readline | GNU Readline (macOS only) | `/usr/local/readline-x.y` |
@@ -58,7 +58,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev patchelf git gfortran
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev patchelf git gfortran
 ```
 
 For JIT support (optional but recommended):
@@ -77,7 +77,7 @@ sudo apt install cmake ninja-build g++
 ### Linux (Fedora/RHEL)
 
 ```bash
-sudo dnf install gcc make bison flex readline-devel zlib-devel patchelf git gcc-gfortran
+sudo dnf install gcc make bison flex readline-devel zlib-devel openssl-devel patchelf git gcc-gfortran
 ```
 
 For JIT support:
@@ -470,9 +470,9 @@ Pin specific versions instead of auto-detecting latest:
 # pginstall.conf
 [versions]
 postgresql = 17.2
-openssl = 3.6.1
+openssl = 3.6.1    # macOS only; ignored on Linux (system libssl-dev is used)
 icu = 76.1
-readline = 8.2
+readline = 8.2     # macOS only; ignored on Linux (system libreadline-dev is used)
 q3c = 2.0.1
 ast = 9.3.0
 pgast = main
@@ -488,7 +488,7 @@ Components are built in dependency order:
 1. readline (macOS only)
    └── Required by PostgreSQL for command-line editing
 
-2. OpenSSL
+2. OpenSSL (macOS only; Linux links the system libssl-dev instead)
    └── Required by PostgreSQL for pgcrypto and SSL support
 
 3. ICU
@@ -757,7 +757,7 @@ The installer auto-detects latest versions from:
 | Component | Source |
 |-----------|--------|
 | ICU | GitHub API: unicode-org/icu releases |
-| OpenSSL | GitHub API: openssl/openssl releases |
+| OpenSSL | GitHub API: openssl/openssl releases (macOS only) |
 | PostgreSQL | PostgreSQL FTP directory listing |
 | readline | GNU FTP directory listing |
 | q3c | GitHub API: segasai/q3c releases |

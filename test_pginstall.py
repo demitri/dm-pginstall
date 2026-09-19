@@ -492,9 +492,11 @@ def test_skip_extensions_avoids_their_upstream_queries():
 
     try:
         versions = p.load_versions(None, skip_extensions=True)
-        expected = ["icu", "openssl", "postgresql"]
+        expected = ["icu", "postgresql"]
         if p.get_platform() == "darwin":
-            expected.append("readline")
+            # Linux links the system libssl-dev; openssl/readline are only
+            # detected (and only built from source) on macOS.
+            expected.extend(["openssl", "readline"])
         check("no q3c/ast/pgast when skipped", sorted(versions), sorted(expected))
 
         # An explicit '--component q3c' still wins over --skip-extensions,

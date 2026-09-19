@@ -15,10 +15,12 @@ Usage:
     pgstatus.py stop <instance>     # Stop an instance
     pgstatus.py restart <instance>  # Restart an instance
     pgstatus.py -D /path/to/pgdata  # Scan a specific data directory
+    pgstatus.py databases           # List instances with their databases
+    pgstatus.py databases main      # Databases for a specific instance
 
 Options:
-    --json          Output as JSON (for list, info)
-    --expand        Show expanded details (for list)
+    --json          Output as JSON (for list, info, databases)
+    --expand        Show expanded details (for list, databases)
     --dry-run       Show what would be done (for start/stop/restart)
     -D, --pgdata    Additional data directory to scan (repeatable)
 """
@@ -61,6 +63,20 @@ class ServiceType(Enum):
 
 
 @dataclass
+class DatabaseInfo:
+    """Represents a database within a PostgreSQL instance."""
+    name: str
+    owner: str
+    size: Optional[str] = None  # human-readable, e.g. "1.2 GB"
+    encoding: Optional[str] = None
+    connections: Optional[int] = None  # active connection count
+    allows_connections: bool = True
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+
+@dataclass
 class PostgreSQLInstance:
     """Represents a discovered PostgreSQL instance."""
     name: str
@@ -79,12 +95,16 @@ class PostgreSQLInstance:
     pg_ctl_path: Optional[Path] = None
     stale_postmaster_pid: bool = False
     notes: list[str] = field(default_factory=list)
+    databases: Optional[list[DatabaseInfo]] = None
+    databases_error: Optional[str] = None  # auth failure message, if any
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         result = {}
         for k, v in asdict(self).items():
-            if isinstance(v, Path):
+            if k == "databases" and self.databases is not None:
+                result[k] = [db.to_dict() for db in self.databases]
+            elif isinstance(v, Path):
                 result[k] = str(v) if v else None
             elif isinstance(v, Enum):
                 result[k] = v.value
@@ -1159,6 +1179,170 @@ def discover_disabled_systemd_instances(
 
 
 # =============================================================================
+# Database Listing
+# =============================================================================
+
+# SQL query to list databases with size, owner, encoding, and connection count.
+# Uses pg_size_pretty for human-readable sizes and a LEFT JOIN on pg_stat_activity
+# for active connection counts (which requires no special privileges beyond
+# connecting to the database).
+_DB_LIST_SQL = """\
+SELECT d.datname,
+       pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size,
+       pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+       d.datallowconn,
+       (SELECT count(*) FROM pg_catalog.pg_stat_activity a
+        WHERE a.datname = d.datname) AS connections
+FROM pg_catalog.pg_database d
+ORDER BY d.datname;
+"""
+
+
+def parse_pgstatus_hints(env_file: Path) -> dict[str, str]:
+    """Parse '# pgstatus:key=value' comments from an instance env file.
+
+    These optional hints let administrators tell pgstatus how to connect
+    without requiring sudo or .pgpass.  Recognised keys:
+
+        # pgstatus:user=monitor_role
+        # pgstatus:dbname=postgres
+    """
+    hints: dict[str, str] = {}
+    try:
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            m = re.match(r"^#\s*pgstatus:(\w+)\s*=\s*(.+)$", line)
+            if m:
+                hints[m.group(1)] = m.group(2).strip()
+    except (OSError, PermissionError):
+        pass
+    return hints
+
+
+def _run_psql_query(
+    port: int,
+    sql: str,
+    user: Optional[str] = None,
+    dbname: str = "postgres",
+    pg_bin: Optional[Path] = None,
+    as_system_user: Optional[str] = None,
+) -> Optional[str]:
+    """Run a psql query and return raw CSV output, or None on failure.
+
+    If *as_system_user* is set (e.g. "postgres"), the command is wrapped in
+    ``sudo -u <user> ...`` which works when pgstatus is run as root and the
+    target user has peer authentication in pg_hba.conf.
+    """
+    psql = str(pg_bin / "psql") if pg_bin else "psql"
+    cmd: list[str] = []
+    if as_system_user:
+        cmd = ["sudo", "-n", "-u", as_system_user]
+    cmd.extend([
+        psql, "-h", "localhost", "-p", str(port),
+        "-d", dbname, "-t", "-A", "-F", "|",
+        "-c", sql,
+    ])
+    if user:
+        cmd.extend(["-U", user])
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "PGCONNECT_TIMEOUT": "3"},
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _parse_db_rows(raw: str) -> list[DatabaseInfo]:
+    """Parse psql CSV output into DatabaseInfo objects."""
+    databases = []
+    for line in raw.splitlines():
+        parts = line.split("|")
+        if len(parts) < 6:
+            continue
+        name, owner, size, encoding, allowconn, connections = (
+            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5],
+        )
+        databases.append(DatabaseInfo(
+            name=name,
+            owner=owner,
+            size=size if size else None,
+            encoding=encoding if encoding else None,
+            connections=int(connections) if connections.isdigit() else None,
+            allows_connections=(allowconn == "t"),
+        ))
+    return databases
+
+
+def query_instance_databases(instance: PostgreSQLInstance) -> None:
+    """Try to list databases for a running instance.
+
+    Attempts connection strategies in order:
+      1. Env-file pgstatus:user hint (if env file exists)
+      2. Peer auth as current OS user
+      3. sudo -u postgres (if running as root)
+      4. .pgpass credentials (implicit via libpq when no user is specified)
+
+    On success, sets instance.databases.  On failure, sets
+    instance.databases_error with a short explanation.
+    """
+    if instance.status != InstanceStatus.RUNNING or instance.port is None:
+        return
+
+    pg_bin = instance.pg_ctl_path.parent if instance.pg_ctl_path else None
+
+    # Strategy 1: env-file hints
+    if instance.env_file and instance.env_file.exists():
+        hints = parse_pgstatus_hints(instance.env_file)
+        if "user" in hints:
+            dbname = hints.get("dbname", "postgres")
+            raw = _run_psql_query(
+                instance.port, _DB_LIST_SQL,
+                user=hints["user"], dbname=dbname, pg_bin=pg_bin,
+            )
+            if raw:
+                instance.databases = _parse_db_rows(raw)
+                return
+
+    # Strategy 2: peer auth as current user
+    raw = _run_psql_query(instance.port, _DB_LIST_SQL, pg_bin=pg_bin)
+    if raw:
+        instance.databases = _parse_db_rows(raw)
+        return
+
+    # Strategy 3: sudo -u postgres (only if we are root)
+    if os.geteuid() == 0:
+        raw = _run_psql_query(
+            instance.port, _DB_LIST_SQL,
+            pg_bin=pg_bin, as_system_user="postgres",
+        )
+        if raw:
+            instance.databases = _parse_db_rows(raw)
+            return
+
+    # Build actionable remediation hints
+    hints: list[str] = ["could not authenticate — try one of:"]
+    hints.append("  sudo pgstatus.py databases")
+    hints.append(f"  Add to ~/.pgpass:  localhost:{instance.port}:*:<user>:<password>")
+    if instance.env_file:
+        hints.append(f"  Add to {instance.env_file}:  # pgstatus:user=<role>")
+    instance.databases_error = "\n".join(hints)
+
+
+def enrich_databases(instances: list[PostgreSQLInstance]) -> None:
+    """Query databases for all running instances."""
+    for inst in instances:
+        query_instance_databases(inst)
+
+
+# =============================================================================
 # Instance Resolution
 # =============================================================================
 
@@ -1350,6 +1534,29 @@ def service_type_label(service_type: ServiceType) -> str:
     return labels.get(service_type, "-")
 
 
+def _format_databases_block(instance: PostgreSQLInstance, indent: str = "    ") -> list[str]:
+    """Format database listing lines for an instance."""
+    lines: list[str] = []
+    if instance.databases is not None:
+        lines.append("")
+        lines.append(f"{indent}Databases:")
+        for db in instance.databases:
+            parts = [f"owner: {db.owner}"]
+            if db.size:
+                parts.append(db.size)
+            if not db.allows_connections:
+                parts.append("no connections")
+            elif db.connections is not None and db.connections > 0:
+                parts.append(f"{db.connections} conn{'s' if db.connections != 1 else ''}")
+            lines.append(f"{indent}  {db.name:<24s}({', '.join(parts)})")
+    elif instance.databases_error:
+        lines.append("")
+        lines.append(f"{indent}Databases:")
+        for err_line in instance.databases_error.splitlines():
+            lines.append(f"{indent}  {err_line}")
+    return lines
+
+
 def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     """Format instances as a table."""
     if not instances:
@@ -1358,10 +1565,15 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
             "Tip: Use -D /path/to/pgdata to check a specific data directory."
         )
 
+    # Check if database info has been queried (i.e. 'databases' command)
+    has_db_info = any(i.databases is not None or i.databases_error for i in instances)
+
     # Column headers and widths
     # "Instance" is Linux terminology (systemd template units); use "Name" on macOS
     name_header = "Instance" if get_platform() == "linux" else "Name"
     headers = [name_header, "Status", "Port", "Version", "Managed", "Data Directory"]
+    if has_db_info:
+        headers.append("Databases")
     rows = []
 
     for inst in instances:
@@ -1377,14 +1589,24 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
             except ValueError:
                 pass
 
-        rows.append([
+        row = [
             inst.name,
             inst.status.value,
             str(inst.port) if inst.port else "-",
             version_str,
             service_type_label(inst.service_type),
             str(inst.data_directory) if inst.data_directory else "-",
-        ])
+        ]
+        if has_db_info:
+            if inst.databases is not None:
+                db_names = [db.name for db in inst.databases
+                            if db.name not in ("template0", "template1")]
+                row.append(", ".join(db_names) if db_names else "(templates only)")
+            elif inst.databases_error:
+                row.append("(auth failed)")
+            else:
+                row.append("-")
+        rows.append(row)
 
     # Calculate column widths
     widths = [len(h) for h in headers]
@@ -1403,6 +1625,14 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     # Rows
     for row in rows:
         lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+    # Auth hints footer for instances where database listing failed
+    auth_failed = [i for i in instances if i.databases_error]
+    if auth_failed:
+        lines.append("")
+        for inst in auth_failed:
+            for err_line in inst.databases_error.splitlines():
+                lines.append(f"  {inst.name}: {err_line}")
 
     # Notes footer for dormant instances
     dormant_with_notes = [i for i in instances if i.status == InstanceStatus.DORMANT and i.notes]
@@ -1493,6 +1723,10 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             lines.append(f"      Status:    systemctl status {inst.service_name}")
             lines.append(f"      Logs:      journalctl -u {inst.service_name}")
 
+        # Databases (shown when enriched via 'databases' command)
+        if inst.databases is not None or inst.databases_error:
+            lines.extend(_format_databases_block(inst, indent="    "))
+
         # Notes
         if inst.notes:
             lines.append("")
@@ -1571,6 +1805,10 @@ def format_info(instance: PostgreSQLInstance) -> str:
         lines.append(f"  Status:      systemctl status {instance.service_name}")
         lines.append(f"  Logs:        journalctl -u {instance.service_name}")
 
+    # Databases section (shown when enriched via 'databases' command)
+    if instance.databases is not None or instance.databases_error:
+        lines.extend(_format_databases_block(instance, indent="  "))
+
     # Notes section
     if instance.notes:
         lines.append("")
@@ -1607,10 +1845,10 @@ _pgstatus_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="list info start stop restart"
+    commands="list databases info start stop restart"
 
     case "${prev}" in
-        info|start|stop|restart)
+        databases|info|start|stop|restart)
             # Complete with instance names
             local instances=$(./pgstatus.py list --json 2>/dev/null | python3 -c "import sys,json; print(' '.join(i['name'] for i in json.load(sys.stdin)))" 2>/dev/null)
             COMPREPLY=( $(compgen -W "${instances}" -- "${cur}") )
@@ -1650,6 +1888,7 @@ _pgstatus() {
     local -a commands instances
     commands=(
         'list:List all PostgreSQL instances'
+        'databases:List databases in each running instance'
         'info:Show detailed info about an instance'
         'start:Start an instance'
         'stop:Stop an instance'
@@ -1698,6 +1937,8 @@ Examples:
   %(prog)s list                 # List all instances
   %(prog)s list --expand        # List with full details and commands
   %(prog)s list --json          # List as JSON
+  %(prog)s databases            # List instances with their databases
+  %(prog)s databases main       # Databases for a specific instance
   %(prog)s info main            # Show detailed info for 'main' instance
   %(prog)s start main           # Start the 'main' instance
   %(prog)s stop main            # Stop the 'main' instance
@@ -1713,7 +1954,7 @@ systemd-managed instances.
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["list", "info", "start", "stop", "restart"],
+        choices=["list", "databases", "info", "start", "stop", "restart"],
         default="list",
         help="Command to run (default: list)",
     )
@@ -1768,7 +2009,7 @@ def main() -> int:
 
     # Discover instances
     extra_paths = [Path(p) for p in args.pgdata] if args.pgdata else None
-    check_latest = args.command in ("list", "info")
+    check_latest = args.command in ("list", "databases", "info")
     instances = discover_all_instances(extra_paths=extra_paths, check_latest=check_latest)
 
     # Handle commands
@@ -1779,6 +2020,30 @@ def main() -> int:
             print(format_list_expanded(instances))
         else:
             print(format_list_table(instances))
+        return 0
+
+    elif args.command == "databases":
+        enrich_databases(instances if not args.instance else [
+            inst for inst in instances if inst == resolve_instance(args.instance, instances)
+        ])
+        if args.instance:
+            instance = resolve_instance(args.instance, instances)
+            if not instance:
+                print(f"Error: Instance '{args.instance}' not found.", file=sys.stderr)
+                if instances:
+                    print(f"Available instances: {', '.join(i.name for i in instances)}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(format_info_json(instance))
+            else:
+                print(format_info(instance))
+        else:
+            if args.json:
+                print(format_list_json(instances))
+            elif args.expand:
+                print(format_list_expanded(instances))
+            else:
+                print(format_list_table(instances))
         return 0
 
     elif args.command == "info":
