@@ -425,8 +425,8 @@ def test_apt_hook_command_actually_parses():
 
 
 def test_jitstate_separates_llvm_packages_from_the_rest():
-    """Hold mode is scoped to the LLVM runtime: holding libc6 would block its
-    security updates to guard against a retirement that never happens."""
+    """The pin package is scoped to the LLVM runtime: depending on libc6 would
+    block its security updates to guard against a retirement that never happens."""
     resolved = {
         "libLLVM.so.21.1": "/lib/x86_64-linux-gnu/libLLVM.so.21.1",
         "libstdc++.so.6": "/lib/x86_64-linux-gnu/libstdc++.so.6",

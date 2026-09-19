@@ -298,6 +298,9 @@ from the built module, never hand-maintained.
 # Declare the dependency to apt
 sudo ./pgjitguard.py protect
 
+# ... and remove it again
+sudo ./pgjitguard.py unprotect
+
 # Run the check automatically after every apt transaction
 sudo ./pgjitguard.py install-hook
 
