@@ -457,7 +457,11 @@ def check_existing(install_path: Path) -> bool:
 def get_pg_configure_flags(install_path: Path) -> Optional[str]:
     """Get the configure flags used to build an existing PostgreSQL installation.
 
-    Returns the configure string from pg_config, or None if pg_config is not found.
+    Returns the configure string from pg_config, or None if pg_config does not
+    exist at the expected path (a normal condition: an incomplete or foreign
+    install directory). A pg_config that exists but fails to run is a genuine
+    error and is reported to stderr rather than swallowed, since the caller
+    otherwise cannot tell "confirmed nothing missing" from "could not check".
     """
     pg_config = install_path / "bin" / "pg_config"
     if not pg_config.exists():
@@ -471,20 +475,27 @@ def get_pg_configure_flags(install_path: Path) -> Optional[str]:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
+        print(f"  WARNING: {pg_config} --configure exited {result.returncode}; "
+              f"cannot verify existing build's configure flags.", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"    {result.stderr.strip()}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  WARNING: could not run {pg_config} --configure: {e}",
+              file=sys.stderr)
     return None
 
 
-def check_pg_needs_rebuild(install_path: Path, required_flags: list[str]) -> list[str]:
+def check_pg_needs_rebuild(install_path: Path,
+                            required_flags: list[str]) -> Optional[list[str]]:
     """Check if an existing PostgreSQL installation is missing required configure flags.
 
-    Returns a list of missing flags, or an empty list if all are present.
+    Returns a list of missing flags (empty if all are present), or None if the
+    existing build's configure flags could not be determined at all -- the
+    caller must not treat that as "nothing missing".
     """
     configure_str = get_pg_configure_flags(install_path)
     if configure_str is None:
-        # Can't determine — assume it's fine
-        return []
+        return None
     missing = [flag for flag in required_flags if flag not in configure_str]
     return missing
 
@@ -1459,7 +1470,26 @@ def build_postgresql(
 
     if check_existing(install_path):
         missing_flags = check_pg_needs_rebuild(install_path, required_configure_flags)
-        if missing_flags:
+        if missing_flags is None:
+            print(f"  Already installed: {install_path}")
+            print(f"  WARNING: could not verify the existing build's configure"
+                  f" flags (see above); cannot confirm "
+                  f"{', '.join(required_configure_flags)} are all present.")
+            if not dry_run:
+                needs_rebuild = prompt_yes_no(
+                    f"  Rebuild PostgreSQL {version} to be sure?",
+                    default=False,
+                )
+            else:
+                needs_rebuild = False
+                print(f"  Cannot verify configure flags in dry-run; "
+                      f"would ask whether to rebuild")
+            if not needs_rebuild:
+                print(f"  Skipping rebuild")
+                if update_symlink:
+                    create_symlink(install_path, symlink_path, dry_run)
+                return
+        elif missing_flags:
             print(f"  Already installed: {install_path}")
             print(f"  WARNING: Existing build is missing: {', '.join(missing_flags)}")
             if not dry_run:

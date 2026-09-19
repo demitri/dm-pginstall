@@ -110,6 +110,19 @@ def test_rebuild_forced_when_llvm_was_never_enabled():
         p.get_pg_configure_flags = saved
 
 
+def test_rebuild_check_reports_undetermined_rather_than_assuming_fine():
+    """The regression: get_pg_configure_flags() failing (pg_config errors, times
+    out, etc.) used to be silently treated as 'nothing missing', so a broken
+    check could skip a needed rebuild without telling anyone."""
+    saved = p.get_pg_configure_flags
+    p.get_pg_configure_flags = lambda path: None
+    try:
+        check("undetermined is distinct from 'nothing missing'",
+              p.check_pg_needs_rebuild(Path("/x"), ["--with-llvm"]), None)
+    finally:
+        p.get_pg_configure_flags = saved
+
+
 def test_build_postgresql_requires_the_concrete_llvm_identity():
     """End of the chain: build_postgresql must ask for the specific
     LLVM_CONFIG, not merely for --with-llvm. Requiring only the flag is what let
