@@ -14,7 +14,7 @@ A Python-based installer that automates building PostgreSQL and its dependencies
 
 ```bash
 # Install prerequisites (Debian/Ubuntu)
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev patchelf git
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git
 
 # Create source directory (one-time setup)
 sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
@@ -58,7 +58,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev patchelf git gfortran
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git gfortran
 ```
 
 For JIT support (optional but recommended):
@@ -74,10 +74,13 @@ sudo apt install cmake ninja-build g++
 
 > **Note**: `gfortran` is required for building the Starlink AST library. If using `--exclude-ast`, it can be omitted.
 
+> **Note**: `liblz4-dev` and `libzstd-dev` enable LZ4 and Zstandard compression (`--with-lz4`, `--with-zstd`), used for
+> TOAST compression, WAL compression, and `pg_basebackup`/`pg_dump` compression. They are Linux only; macOS builds omit them.
+
 ### Linux (Fedora/RHEL)
 
 ```bash
-sudo dnf install gcc make bison flex readline-devel zlib-devel openssl-devel patchelf git gcc-gfortran
+sudo dnf install gcc make bison flex readline-devel zlib-devel openssl-devel lz4-devel libzstd-devel patchelf git gcc-gfortran
 ```
 
 For JIT support:

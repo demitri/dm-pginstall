@@ -305,6 +305,26 @@ def get_llvm_version(llvm_config: str) -> Optional[str]:
     return result.stdout.strip() or None
 
 
+def get_llvm_libdir(llvm_config: str) -> Optional[Path]:
+    """Return the directory holding this toolchain's shared LLVM runtime.
+
+    Ask llvm-config rather than deriving it from the binary's location: a
+    distro llvm-config may sit in /usr/bin while its runtime lives under
+    /usr/lib/llvm-NN/lib, and guessing '../lib' finds nothing there.
+    """
+    try:
+        result = subprocess.run(
+            [llvm_config, "--libdir"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip())
+    # Fall back to the conventional layout beside the binary.
+    fallback = Path(llvm_config).parent.parent / "lib"
+    return fallback if fallback.is_dir() else None
+
+
 def get_pg_config_setting(pg_config: Path, flag: str) -> Optional[str]:
     """Return a single pg_config setting, or None if it could not be queried."""
     try:
@@ -346,7 +366,7 @@ def get_llvm_install_command() -> Optional[str]:
 
 
 def offer_jit_protection(dry_run: bool, pg_config: Path,
-                         private_llvm: bool = False) -> None:
+                         self_contained: bool = False) -> None:
     """After a JIT-enabled build, offer to make the LLVM dependency visible to apt.
 
     llvmjit.so links against a specific versioned LLVM runtime that the package
@@ -360,10 +380,17 @@ def offer_jit_protection(dry_run: bool, pg_config: Path,
     (or a declined symlink update) can leave pointing at an older installation —
     protecting that one would report success while leaving this build exposed.
 
-    private_llvm says the build links a privately built LLVM. There is then
-    nothing to protect, but a pin from before the switch may still be installed
-    and still depending on the old system runtime, which stops apt reclaiming
-    it. That cleanup must not depend on someone answering a prompt.
+    self_contained says the installation carries its own copy of the LLVM
+    runtime -- embedded into pkglibdir from wherever it came, or a private tree
+    under /usr/local that no package owns. There is then nothing to protect,
+    but a pin from before the switch may still be installed and still depending
+    on the old system runtime, which stops apt reclaiming it. That cleanup must
+    not depend on someone answering a prompt.
+
+    It is deliberately the built installation's real state, not a guess from
+    which llvm-config was used: if embedding failed, the dependency is still
+    live and the offer below is the only thing standing between the user and a
+    silently broken JIT.
     """
     if get_platform() != "linux":
         return
@@ -371,11 +398,10 @@ def offer_jit_protection(dry_run: bool, pg_config: Path,
     print(f"\n{'=' * 60}")
     print("JIT dependency protection")
     print(f"{'=' * 60}")
-    if private_llvm:
-        print("\n  PostgreSQL was built against a private LLVM under"
-              f" {INSTALL_BASE},")
-        print("  which no package manager owns. Nothing can remove it, so there")
-        print("  is nothing to protect.")
+    if self_contained:
+        print("\n  PostgreSQL carries its own copy of the LLVM runtime, which no")
+        print("  package manager owns. Nothing outside the installation can remove")
+        print("  it, so there is nothing to protect.")
     else:
         print("\n  PostgreSQL was built with JIT support. llvmjit.so links against a")
         print("  specific LLVM runtime that the package manager has no record of, so")
@@ -394,7 +420,7 @@ def offer_jit_protection(dry_run: bool, pg_config: Path,
     protect_cmd = ["sudo", str(guard), "--pg-config", str(pg_config), "protect"]
     protect_hint = f"sudo {guard} --pg-config {pg_config} protect"
 
-    if private_llvm and detect_package_manager() != "apt":
+    if self_contained and detect_package_manager() != "apt":
         # Nothing to protect and no dpkg to clean up. Saying anything about
         # versionlock here would contradict the banner above.
         print("\n  Nothing further to do.")
@@ -413,7 +439,7 @@ def offer_jit_protection(dry_run: bool, pg_config: Path,
     # Ahead of the existence check: during a dry run of a new version the
     # versioned path legitimately does not exist yet, and the point of a dry
     # run is to show the plan rather than report the absence.
-    if private_llvm:
+    if self_contained:
         # Nothing to protect, so nothing to ask. Run the guard anyway: it is a
         # no-op unless a pin survives from before the switch, in which case it
         # removes the package still pinning the old system LLVM.
@@ -496,6 +522,29 @@ def get_pg_configure_flags(install_path: Path) -> Optional[str]:
         print(f"  WARNING: could not run {pg_config} --configure: {e}",
               file=sys.stderr)
     return None
+
+
+def get_compression_configure_flags(version: str) -> list[str]:
+    """Return the LZ4/Zstandard configure flags supported by this PostgreSQL version.
+
+    Linux only: lz4 and zstd are taken from the system packages (liblz4-dev,
+    libzstd-dev). macOS does not build them here, so no flags are added.
+    --with-lz4 requires PostgreSQL 14+, --with-zstd requires 15+.
+    """
+    if get_platform() == "darwin":
+        return []
+
+    try:
+        major = int(version.split(".")[0])
+    except (ValueError, IndexError):
+        return []
+
+    flags = []
+    if major >= 14:
+        flags.append("--with-lz4")
+    if major >= 15:
+        flags.append("--with-zstd")
+    return flags
 
 
 def check_pg_needs_rebuild(install_path: Path,
@@ -597,8 +646,14 @@ def run_build_cmd(
     dry_run: bool = False,
     verbose: bool = False,
     description: str = "",
-) -> None:
-    """Execute build command with error handling."""
+    allow_failure: bool = False,
+) -> bool:
+    """Execute build command with error handling.
+
+    Returns whether the command succeeded. A failure normally ends the run;
+    allow_failure=True is for steps with a working fallback, where aborting the
+    whole install would be a worse answer than taking the slower path.
+    """
     if env is None:
         env = get_sanitized_env()
 
@@ -610,7 +665,7 @@ def run_build_cmd(
         print(f"  In: {cwd}")
 
     if dry_run:
-        return
+        return True
 
     try:
         if verbose:
@@ -620,6 +675,8 @@ def run_build_cmd(
                 cmd, cwd=cwd, env=env, check=True, capture_output=True, text=True
             )
     except subprocess.CalledProcessError as e:
+        if allow_failure:
+            return False
         print(f"Error running command: {cmd_str}", file=sys.stderr)
         print(f"Exit code: {e.returncode}", file=sys.stderr)
         if e.stdout:
@@ -627,6 +684,7 @@ def run_build_cmd(
         if e.stderr:
             print(f"stderr: {e.stderr}", file=sys.stderr)
         sys.exit(1)
+    return True
 
 
 def download_file(url: str, dest: Path, dry_run: bool = False) -> None:
@@ -1287,6 +1345,51 @@ def find_llvm_runtime_libs(libdir: Path) -> list[Path]:
             if not c.name.startswith("libLLVM-C") and c.is_file()]
 
 
+def same_filesystem(a: Path, b: Path) -> bool:
+    """Are these two paths on one filesystem? (i.e. can they share an inode)"""
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def llvm_runtime_is_embedded(install_path: Path) -> bool:
+    """Does this PostgreSQL installation already carry its own LLVM runtime?
+
+    Used for the installations a run did not rebuild. Reporting protection from
+    intent rather than from what is on disk is how a build ends up described as
+    self-contained while llvmjit.so still points at a runtime apt can retire.
+
+    Both halves must be there: the runtime beside the module, and the $ORIGIN
+    rpath that makes the module load it. An embed interrupted between the two
+    leaves the library sitting in pkglibdir unused, which looks finished and is
+    not -- so anything unverifiable counts as not embedded, and the embed runs
+    again. It is idempotent; a needless retry costs a second.
+    """
+    pkglibdir_str = get_pg_config_setting(
+        install_path / "bin" / "pg_config", "--pkglibdir")
+    pkglibdir = Path(pkglibdir_str) if pkglibdir_str else install_path / "lib"
+    if not find_llvm_runtime_libs(pkglibdir):
+        return False
+
+    llvmjit = pkglibdir / "llvmjit.so"
+    if not llvmjit.is_file():
+        # No JIT module: nothing here links the runtime, so nothing to finish.
+        return True
+    if get_platform() == "darwin":
+        return True          # rpath rewriting is not part of the macOS path
+
+    patchelf = find_system_patchelf()
+    if not patchelf:
+        return False
+    try:
+        result = subprocess.run([patchelf, "--print-rpath", str(llvmjit)],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "$ORIGIN" in result.stdout
+
+
 def llvm_install_is_complete(install_path: Path) -> bool:
     """Return True only if an LLVM install has the pieces PostgreSQL needs.
 
@@ -1456,61 +1559,99 @@ def build_llvm(
         print("  PostgreSQL will use it automatically on the next build.")
 
 
-def embed_private_llvm_runtime(pkglibdir: Path, llvm_libdir: Path, verbose: bool) -> None:
-    """Copy the private LLVM's shared runtime into pkglibdir and rpath to it.
+def embed_llvm_runtime(pkglibdir: Path, llvm_libdir: Path, verbose: bool) -> bool:
+    """Copy the LLVM shared runtime into pkglibdir and rpath llvmjit.so to it.
 
-    llvmjit.so is built with an rpath pointing at the private LLVM tree
-    (see build_postgresql), which works but leaves this PostgreSQL install
-    dependent on that tree continuing to exist. If it is later deleted --
-    reasonable cleanup once /usr/local/llvm has moved on to a newer version --
-    JIT breaks the same way a retired system LLVM does: silently, only on a
-    query that crosses jit_above_cost. Copying the runtime in and rpathing to
-    '$ORIGIN' makes this PostgreSQL install carry its own copy, so nothing
-    outside it can break JIT by disappearing.
+    llvmjit.so links a libLLVM that lives outside this installation -- either
+    the distro's (owned by a package apt will retire the day it moves to the
+    next major version) or a private build under /usr/local/llvm-NN (a tree
+    that is reasonable to delete once something newer replaces it). Either way,
+    when it goes, JIT breaks silently: nothing fails until a query crosses
+    jit_above_cost. Copying the runtime in and rpathing to '$ORIGIN' makes the
+    installation carry its own copy, so nothing outside it can take the runtime
+    away. It also decouples the two: the copy stays on the exact LLVM the
+    bitcode was compiled against, whatever the system does afterwards.
+
+    The runtime is hard-linked when the source and pkglibdir share a
+    filesystem, so this usually costs no additional disk space at all; only a
+    cross-filesystem install pays the ~120 MB. Either way the installation stops
+    receiving the distro's LLVM security updates for that runtime -- deliberate,
+    since silently changing the runtime under a built JIT is the failure being
+    prevented.
 
     Linux only: patchelf's rpath rewriting is ELF-specific. On other
     platforms llvmjit.so keeps the absolute rpath set at build time, so this
     is a hardening step, not something later steps depend on.
     """
     if get_platform() == "darwin":
-        return
+        return False
 
     llvmjit = pkglibdir / "llvmjit.so"
     if not llvmjit.is_file():
         print(f"  WARNING: {llvmjit} not found; cannot embed the LLVM runtime.",
               file=sys.stderr)
-        return
+        return False
 
     runtime_libs = find_llvm_runtime_libs(llvm_libdir)
     if not runtime_libs:
         print(f"  WARNING: no LLVM runtime library found in {llvm_libdir}; "
               f"cannot embed it.", file=sys.stderr)
-        return
+        return False
 
     patchelf = find_system_patchelf()
     if not patchelf:
         print("  WARNING: patchelf not found; leaving llvmjit.so rpathed to "
               f"{llvm_libdir}.", file=sys.stderr)
-        return
+        return False
 
+    # A hard link is preferred over a copy: same protection, no second 120 MB.
+    # It is safe because package managers replace a file by writing a new one
+    # and renaming it over the old name, which leaves our link pointing at the
+    # original inode -- the old runtime stays intact and stays ours. Removing
+    # the package merely drops its name; the data lives as long as this link
+    # does. (An in-place rewrite of the library would be seen through the link,
+    # but dpkg and rpm do not do that.) Cross-filesystem, inodes cannot be
+    # shared at all, so there a copy is the only option.
+    linkable = same_filesystem(llvm_libdir, pkglibdir)
+    how = "Linking" if linkable else "Copying"
     print(f"  Embedding LLVM runtime into {pkglibdir} (self-contained install)...")
+    linked = 0
     for lib in runtime_libs:
-        run_build_cmd(["sudo", "cp", "-P", str(lib), str(pkglibdir / lib.name)],
-                       cwd=pkglibdir, verbose=verbose,
-                       description=f"    Copying {lib.name}")
-    run_build_cmd([patchelf, "--set-rpath", "$ORIGIN", str(llvmjit)],
+        dest = pkglibdir / lib.name
+        placed = False
+        if linkable:
+            placed = run_build_cmd(
+                ["sudo", "cp", "-l", "-P", str(lib), str(dest)],
+                cwd=pkglibdir, verbose=verbose,
+                description=f"    {how} {lib.name}", allow_failure=True)
+            linked += 1 if placed else 0
+        if not placed:
+            run_build_cmd(["sudo", "cp", "-P", str(lib), str(dest)],
+                          cwd=pkglibdir, verbose=verbose,
+                          description=f"    Copying {lib.name}")
+    # sudo: pkglibdir and everything in it belong to root after 'make install',
+    # and patchelf rewrites the file in place.
+    run_build_cmd(["sudo", patchelf, "--set-rpath", "$ORIGIN", str(llvmjit)],
                   cwd=pkglibdir, verbose=verbose,
                   description="    Setting llvmjit.so rpath to $ORIGIN")
     if not verbose:
-        print(f"    Copied {len(runtime_libs)} file(s); rpath set to $ORIGIN")
+        placed = f"{len(runtime_libs)} file(s)"
+        note = (f" ({linked} hard-linked, no extra disk space)" if linked
+                else " (copied)")
+        print(f"    Embedded {placed}{note}; rpath set to $ORIGIN")
+    return True
 
 
 def build_postgresql(
     version: str, dry_run: bool = False, verbose: bool = False,
     with_llvm: bool = False, no_alias: bool = False,
     llvm_config: Optional[str] = None,
-) -> None:
-    """Build PostgreSQL from source."""
+) -> bool:
+    """Build PostgreSQL from source.
+
+    Returns whether this installation's LLVM runtime ended up self-contained,
+    which decides what the JIT protection step afterwards has to say.
+    """
     install_path = INSTALL_BASE / f"postgresql-{version}"
     symlink_path = INSTALL_BASE / "postgresql"
 
@@ -1554,7 +1695,8 @@ def build_postgresql(
                     print(f"  Would ask whether to update symlink to version {version}")
 
     # Check if existing installation needs rebuild due to missing configure flags
-    required_configure_flags = ["--with-icu", "--with-openssl"]
+    compression_flags = get_compression_configure_flags(version)
+    required_configure_flags = ["--with-icu", "--with-openssl"] + compression_flags
     if with_llvm:
         required_configure_flags.append("--with-llvm")
         # Identity, not just presence. An existing build may already carry
@@ -1566,6 +1708,42 @@ def build_postgresql(
         if llvm_config:
             required_configure_flags.append(f"LLVM_CONFIG={llvm_config}")
     needs_rebuild = False
+
+    def embed_into_existing() -> bool:
+        """Make an installation we are NOT rebuilding self-contained.
+
+        Embedding is an independent step -- copying a file and rewriting an
+        rpath -- so it must not require an hour of rebuilding to reach. This is
+        also the recovery path when embedding failed partway through an earlier
+        run: it is idempotent, and an installation left depending on a system
+        runtime is exactly what this is here to prevent.
+        """
+        if not (with_llvm and llvm_config):
+            return False
+        if llvm_runtime_is_embedded(install_path):
+            return True
+
+        libdir = get_llvm_libdir(llvm_config)
+        if not libdir:
+            return False
+        pkglibdir_str = get_pg_config_setting(
+            install_path / "bin" / "pg_config", "--pkglibdir")
+        pkglibdir = Path(pkglibdir_str) if pkglibdir_str else install_path / "lib"
+
+        if find_llvm_runtime_libs(pkglibdir):
+            # The library was placed but llvmjit.so was never pointed at it.
+            print(f"\n  A previous embed did not finish: the LLVM runtime is in")
+            print(f"  {pkglibdir}, but llvmjit.so's rpath was never rewritten.")
+        else:
+            print(f"\n  This installation's JIT still depends on the LLVM runtime in")
+            print(f"  {libdir}, which the package manager can remove.")
+        if dry_run:
+            print(f"  Would embed the LLVM runtime from {libdir} into {pkglibdir}")
+            return True
+        if not prompt_yes_no("  Embed a copy now (no rebuild needed)?", default=True):
+            print("  Left depending on the system runtime.")
+            return False
+        return embed_llvm_runtime(pkglibdir, libdir, verbose)
 
     if check_existing(install_path):
         missing_flags = check_pg_needs_rebuild(install_path, required_configure_flags)
@@ -1587,7 +1765,7 @@ def build_postgresql(
                 print(f"  Skipping rebuild")
                 if update_symlink:
                     create_symlink(install_path, symlink_path, dry_run)
-                return
+                return embed_into_existing()
         elif missing_flags:
             print(f"  Already installed: {install_path}")
             print(f"  WARNING: Existing build is missing: {', '.join(missing_flags)}")
@@ -1603,14 +1781,14 @@ def build_postgresql(
                 print(f"  Skipping rebuild")
                 if update_symlink:
                     create_symlink(install_path, symlink_path, dry_run)
-                return
+                return embed_into_existing()
         else:
             print(f"  Already installed: {install_path}")
             if update_symlink:
                 create_symlink(install_path, symlink_path, dry_run)
             else:
                 print(f"  Symlink not updated (still points to {current_symlink_target})")
-            return
+            return embed_into_existing()
 
     # Download and extract (or reuse existing source for rebuild)
     src_path = SRC_DIR / f"postgresql-{version}"
@@ -1669,8 +1847,15 @@ def build_postgresql(
         print("  OpenSSL: system package (libssl-dev)")
         env["LDFLAGS"] = f"-Wl,-rpath,{icu_path}/lib"
 
+    # LZ4/Zstandard compression (Linux; system packages liblz4-dev, libzstd-dev)
+    if compression_flags:
+        configure_cmd.extend(compression_flags)
+        names = ", ".join(f.replace("--with-", "") for f in compression_flags)
+        print(f"  Compression: {names} (system packages)")
+
     # LLVM/JIT support (resolved by caller)
-    private_llvm_libdir: Optional[Path] = None  # set below when private, for embedding after install
+    llvm_runtime_libdir: Optional[Path] = None  # set below, for embedding after install
+    runtime_embedded = False
     if with_llvm:
         if llvm_config:
             # Record the exact toolchain in the build output: llvmjit.so will
@@ -1705,13 +1890,23 @@ def build_postgresql(
                       file=sys.stderr)
 
             # A privately built LLVM is not on the default loader path, so
-            # llvmjit.so needs an rpath to find libLLVM.so at runtime. This is
-            # what keeps the JIT working no matter what the distro does.
-            llvm_libdir = Path(llvm_config).parent.parent / "lib"
-            if str(llvm_libdir).startswith(str(INSTALL_BASE)):
+            # llvmjit.so needs an rpath to find libLLVM.so during the build and
+            # until the runtime is embedded below.
+            llvm_libdir = get_llvm_libdir(llvm_config)
+            if llvm_libdir and str(llvm_libdir).startswith(str(INSTALL_BASE)):
                 print(f"  LLVM rpath: {llvm_libdir}")
                 env["LDFLAGS"] = env.get("LDFLAGS", "") + f" -Wl,-rpath,{llvm_libdir}"
-                private_llvm_libdir = llvm_libdir
+
+            # Embed the runtime whatever its origin. A distro libLLVM is on the
+            # loader path today, but it belongs to a package apt retires at the
+            # next major version -- the same disappearance a private tree risks,
+            # and the reason --build-llvm existed. Copying the system library in
+            # buys that same independence without the hour-long LLVM build.
+            llvm_runtime_libdir = llvm_libdir
+            if llvm_libdir is None:
+                print(f"  WARNING: could not determine the LLVM library "
+                      f"directory from {llvm_config}; the JIT will keep "
+                      f"depending on the system runtime.", file=sys.stderr)
         else:
             # Caller should have validated this, but guard anyway
             print("  WARNING: --with-llvm requested but LLVM not found, skipping")
@@ -1760,23 +1955,25 @@ def build_postgresql(
             description="Installing PostgreSQL...",
         )
 
-        if private_llvm_libdir:
+        if llvm_runtime_libdir:
             pkglibdir_str = get_pg_config_setting(
                 install_path / "bin" / "pg_config", "--pkglibdir")
             if pkglibdir_str:
-                embed_private_llvm_runtime(Path(pkglibdir_str), private_llvm_libdir, verbose)
+                runtime_embedded = embed_llvm_runtime(
+                    Path(pkglibdir_str), llvm_runtime_libdir, verbose)
             else:
                 print(f"  WARNING: could not query pkglibdir from "
                       f"{install_path}/bin/pg_config; leaving llvmjit.so rpathed "
-                      f"to {private_llvm_libdir}.", file=sys.stderr)
+                      f"to {llvm_runtime_libdir}.", file=sys.stderr)
     else:
         if needs_rebuild:
             print("  Would run: make clean")
         print(f"  Would run: {' '.join(configure_cmd)}")
         print("  Would build and install PostgreSQL")
-        if private_llvm_libdir:
-            print("  Would embed the private LLVM runtime into pkglibdir "
-                  "(self-contained install)")
+        if llvm_runtime_libdir:
+            print(f"  Would embed the LLVM runtime from {llvm_runtime_libdir} "
+                  "into pkglibdir (self-contained install)")
+            runtime_embedded = True
 
     # Create/update symlink based on user preference
     if update_symlink:
@@ -1785,6 +1982,7 @@ def build_postgresql(
         print(f"  Symlink not updated (still points to {current_symlink_target})")
 
     print(f"  PostgreSQL {version} installed successfully")
+    return runtime_embedded
 
 
 def build_contrib_extensions(
@@ -2333,6 +2531,22 @@ def check_missing_libraries() -> list[str]:
     if not any(p.exists() for p in openssl_paths):
         missing.append("libssl-dev")
 
+    # Check for LZ4 development headers (PostgreSQL --with-lz4)
+    lz4_paths = [
+        Path("/usr/include/lz4.h"),
+        Path("/usr/local/include/lz4.h"),
+    ]
+    if not any(p.exists() for p in lz4_paths):
+        missing.append("liblz4-dev")
+
+    # Check for Zstandard development headers (PostgreSQL --with-zstd)
+    zstd_paths = [
+        Path("/usr/include/zstd.h"),
+        Path("/usr/local/include/zstd.h"),
+    ]
+    if not any(p.exists() for p in zstd_paths):
+        missing.append("libzstd-dev")
+
     return missing
 
 
@@ -2356,6 +2570,8 @@ def get_package_names_for_tools(tools: list[str], pkg_mgr: str) -> list[str]:
         "libreadline-dev": {"apt": "libreadline-dev", "dnf": "readline-devel", "yum": "readline-devel", "pacman": "readline"},
         "zlib1g-dev": {"apt": "zlib1g-dev", "dnf": "zlib-devel", "yum": "zlib-devel", "pacman": "zlib"},
         "libssl-dev": {"apt": "libssl-dev", "dnf": "openssl-devel", "yum": "openssl-devel", "pacman": "openssl"},
+        "liblz4-dev": {"apt": "liblz4-dev", "dnf": "lz4-devel", "yum": "lz4-devel", "pacman": "lz4"},
+        "libzstd-dev": {"apt": "libzstd-dev", "dnf": "libzstd-devel", "yum": "libzstd-devel", "pacman": "zstd"},
     }
 
     # For apt, build-essential provides make and gcc
@@ -2589,6 +2805,8 @@ def main() -> None:
     building_pg = (args.component is None or args.component == "postgresql")
     use_llvm = False
     llvm_config = None
+    # Set by build_postgresql below; only read when PostgreSQL was built.
+    self_contained_llvm = False
     if building_pg and args.build_llvm and will_build_llvm:
         # Address the private build by its versioned path. --no-alias skips the
         # /usr/local/llvm symlink, and find_llvm_config() would then miss the
@@ -2688,9 +2906,10 @@ def main() -> None:
         elif args.component == "llvm":
             pass  # Validated at startup; already built above.
         elif args.component == "postgresql":
-            build_postgresql(versions["postgresql"], args.dry_run, args.verbose,
-                             with_llvm=use_llvm, no_alias=na,
-                             llvm_config=llvm_config if use_llvm else None)
+            self_contained_llvm = build_postgresql(
+                versions["postgresql"], args.dry_run, args.verbose,
+                with_llvm=use_llvm, no_alias=na,
+                llvm_config=llvm_config if use_llvm else None)
         elif args.component == "contrib":
             build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
         elif args.component == "q3c":
@@ -2712,9 +2931,10 @@ def main() -> None:
             build_openssl(versions["openssl"], args.dry_run, args.verbose, no_alias=na)
 
         build_icu(versions["icu"], args.dry_run, args.verbose, no_alias=na)
-        build_postgresql(versions["postgresql"], args.dry_run, args.verbose,
-                             with_llvm=use_llvm, no_alias=na,
-                             llvm_config=llvm_config if use_llvm else None)
+        self_contained_llvm = build_postgresql(
+            versions["postgresql"], args.dry_run, args.verbose,
+            with_llvm=use_llvm, no_alias=na,
+            llvm_config=llvm_config if use_llvm else None)
         build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
 
         if not args.skip_extensions:
@@ -2736,10 +2956,10 @@ def main() -> None:
         pg_config = (
             INSTALL_BASE / f"postgresql-{versions['postgresql']}" / "bin" / "pg_config"
         )
-        # A private LLVM lives under INSTALL_BASE; a system one does not.
-        private_llvm = bool(llvm_config) and str(llvm_config).startswith(
-            str(INSTALL_BASE))
-        offer_jit_protection(args.dry_run, pg_config, private_llvm=private_llvm)
+        # What the build actually ended up with: an embedded runtime needs no
+        # apt-level protection, a live system dependency does.
+        offer_jit_protection(args.dry_run, pg_config,
+                             self_contained=self_contained_llvm)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ Usage:
     ./test_pginstall.py
 """
 
+import contextlib
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -275,7 +277,7 @@ def test_embed_skips_on_darwin():
         p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("run_build_cmd called on darwin"))
         try:
-            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
         finally:
             p.get_platform, p.run_build_cmd = saved
 
@@ -288,7 +290,7 @@ def test_embed_warns_without_acting_when_llvmjit_missing():
         p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("run_build_cmd called with no llvmjit.so present"))
         try:
-            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
         finally:
             p.get_platform, p.run_build_cmd = saved
 
@@ -301,7 +303,7 @@ def test_embed_warns_without_acting_when_no_runtime_lib():
         p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("run_build_cmd called with no runtime library present"))
         try:
-            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
         finally:
             p.get_platform, p.run_build_cmd = saved
 
@@ -315,36 +317,99 @@ def test_embed_warns_without_acting_when_patchelf_missing():
         p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("run_build_cmd called with no patchelf available"))
         try:
-            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
         finally:
             p.get_platform, p.find_system_patchelf, p.run_build_cmd = saved
 
 
-def test_embed_copies_runtime_and_rpaths_to_origin():
+def test_embed_hard_links_the_runtime_when_it_can():
     """The whole point: llvmjit.so ends up carrying its own copy of the LLVM
-    runtime, rpathed to $ORIGIN, so deleting the private LLVM tree later can't
-    silently break JIT the way a retired system LLVM does."""
+    runtime, rpathed to $ORIGIN, so retiring the LLVM it was built against
+    can't silently break JIT. On one filesystem that costs no disk space: a
+    package manager replaces a file by renaming a new one over it, which leaves
+    the link on the original inode."""
     with tempfile.TemporaryDirectory() as tmp:
-        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)   # one filesystem
         calls = []
+
+        def record(cmd, **kw):
+            calls.append(cmd)
+            return True
+
         saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd)
         p.get_platform = lambda: "linux"
         p.find_system_patchelf = lambda: "/usr/bin/patchelf"
-        p.run_build_cmd = lambda cmd, **kw: calls.append(cmd)
+        p.run_build_cmd = record
         try:
-            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
         finally:
             p.get_platform, p.find_system_patchelf, p.run_build_cmd = saved
 
-        copy_calls = [c for c in calls if c[:2] == ["sudo", "cp"]]
-        patch_calls = [c for c in calls if "patchelf" in c[0]]
-        check("copies the runtime library", len(copy_calls), 1)
-        check("copy source is the private LLVM's lib", copy_calls[0][3],
+        place_calls = [c for c in calls if c[:2] == ["sudo", "cp"]]
+        patch_calls = [c for c in calls if any("patchelf" in part for part in c)]
+        check("places the runtime library once", len(place_calls), 1)
+        check("hard link rather than a second copy", place_calls[0][2], "-l")
+        check("source is the LLVM lib", place_calls[0][4],
               str(llvm_libdir / "libLLVM.so.23.1"))
-        check("copy destination is pkglibdir", copy_calls[0][4],
+        check("destination is pkglibdir", place_calls[0][5],
               str(pkglibdir / "libLLVM.so.23.1"))
-        check("patchelf sets rpath to $ORIGIN", patch_calls[0][1:],
+        # sudo: 'make install' leaves pkglibdir owned by root, and patchelf
+        # rewrites llvmjit.so in place.
+        check("patchelf runs with privileges", patch_calls[0][0], "sudo")
+        check("patchelf sets rpath to $ORIGIN", patch_calls[0][2:],
               ["--set-rpath", "$ORIGIN", str(pkglibdir / "llvmjit.so")])
+
+
+def test_embed_falls_back_to_copying_when_linking_is_impossible():
+    """Inodes cannot be shared across filesystems, and a failed link must not
+    end the install: the copy is slower and bigger, not wrong."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        calls = []
+
+        def record(cmd, **kw):
+            calls.append(cmd)
+            # Whatever the reason, the link did not happen.
+            return "-l" not in cmd
+
+        saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd,
+                 p.same_filesystem)
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+        p.run_build_cmd = record
+        p.same_filesystem = lambda a, b: True      # tried, and it failed
+        try:
+            embedded = p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            (p.get_platform, p.find_system_patchelf, p.run_build_cmd,
+             p.same_filesystem) = saved
+
+        place_calls = [c for c in calls if c[:2] == ["sudo", "cp"]]
+        check("falls back to a plain copy", [c[2] for c in place_calls],
+              ["-l", "-P"])
+        check("copy source is the LLVM lib", place_calls[1][3],
+              str(llvm_libdir / "libLLVM.so.23.1"))
+        check("still a self-contained install", embedded, True)
+
+    # Different filesystems: no point attempting a link at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        calls = []
+        saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd,
+                 p.same_filesystem)
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+        p.run_build_cmd = lambda cmd, **kw: (calls.append(cmd), True)[1]
+        p.same_filesystem = lambda a, b: False
+        try:
+            p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            (p.get_platform, p.find_system_patchelf, p.run_build_cmd,
+             p.same_filesystem) = saved
+
+        place_calls = [c for c in calls if c[:2] == ["sudo", "cp"]]
+        check("no link attempted across filesystems",
+              [c[2] for c in place_calls], ["-P"])
 
 
 def test_incomplete_private_build_is_not_selected():
@@ -623,6 +688,346 @@ def test_latest_llvm_version_skips_prereleases():
         check("picks the newest stable release", p.get_latest_llvm_version(), "23.1.0")
     finally:
         p.github_api_get = saved
+
+
+# ---------------------------------------------------------------------------
+# Embedding the LLVM runtime
+# ---------------------------------------------------------------------------
+
+def test_llvm_libdir_is_asked_for_not_guessed():
+    """A distro llvm-config can live in /usr/bin while its runtime sits in
+    /usr/lib/llvm-NN/lib. Deriving '../lib' from the binary finds nothing, and
+    the runtime then silently goes un-embedded."""
+    with tempfile.TemporaryDirectory() as tmp:
+        real_libdir = Path(tmp) / "llvm-18" / "lib"
+        real_libdir.mkdir(parents=True)
+
+        class Result:
+            returncode = 0
+            stdout = str(real_libdir) + "\n"
+
+        saved = p.subprocess.run
+        p.subprocess.run = lambda *a, **kw: Result()
+        try:
+            check("uses llvm-config --libdir",
+                  p.get_llvm_libdir("/usr/bin/llvm-config"), real_libdir)
+        finally:
+            p.subprocess.run = saved
+
+
+def test_llvm_libdir_falls_back_when_llvm_config_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        libdir = Path(tmp) / "llvm-18" / "lib"
+        libdir.mkdir(parents=True)
+        (Path(tmp) / "llvm-18" / "bin").mkdir()
+
+        class Result:
+            returncode = 1
+            stdout = ""
+
+        saved = p.subprocess.run
+        p.subprocess.run = lambda *a, **kw: Result()
+        try:
+            check("falls back to the conventional layout",
+                  p.get_llvm_libdir(str(Path(tmp) / "llvm-18" / "bin" / "llvm-config")),
+                  libdir)
+            check("no directory, no guess",
+                  p.get_llvm_libdir("/nonexistent/bin/llvm-config"), None)
+        finally:
+            p.subprocess.run = saved
+
+
+def test_embed_reports_whether_it_actually_embedded():
+    """The return value becomes "nothing to protect" in the JIT protection step.
+    A warning path that reported success like a real embed would silence the one
+    prompt standing between a live system dependency and a broken JIT."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd)
+        p.get_platform = lambda: "linux"
+        p.run_build_cmd = lambda *a, **kw: True
+        try:
+            p.find_system_patchelf = lambda: None
+            check("no patchelf is not an embed",
+                  p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False), False)
+            p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+            check("a real embed reports success",
+                  p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False), True)
+            p.get_platform = lambda: "darwin"
+            check("darwin is not an embed",
+                  p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False), False)
+        finally:
+            p.get_platform, p.find_system_patchelf, p.run_build_cmd = saved
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp, with_runtime_lib=False)
+        saved = (p.get_platform, p.find_system_patchelf)
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+        try:
+            check("nothing to copy is not an embed",
+                  p.embed_llvm_runtime(pkglibdir, llvm_libdir, verbose=False), False)
+        finally:
+            p.get_platform, p.find_system_patchelf = saved
+
+
+def test_untouched_install_is_judged_by_what_is_on_disk():
+    """A run that rebuilds nothing still reports whether that installation is
+    self-contained. Answering from intent would describe a build as protected
+    on the strength of a flag passed to a build that never happened."""
+    with tempfile.TemporaryDirectory() as tmp:
+        install = Path(tmp) / "postgresql-18.6"
+        (install / "lib").mkdir(parents=True)
+        (install / "bin").mkdir()
+        saved = (p.get_pg_config_setting, p.get_platform)
+        p.get_pg_config_setting = lambda pg_config, flag: None   # uninspectable
+        p.get_platform = lambda: "linux"
+        try:
+            check("no runtime in pkglibdir", p.llvm_runtime_is_embedded(install), False)
+            (install / "lib" / "libLLVM.so.18.1").write_text("")
+            check("runtime present, and nothing here links it",
+                  p.llvm_runtime_is_embedded(install), True)
+        finally:
+            p.get_pg_config_setting, p.get_platform = saved
+
+
+def test_an_interrupted_embed_is_not_mistaken_for_a_finished_one():
+    """The real failure this came from: the runtime was linked into pkglibdir,
+    then the rpath rewrite died on a missing sudo. The library sitting there
+    unused looks finished, so a later run would skip the half that matters."""
+    with tempfile.TemporaryDirectory() as tmp:
+        install = Path(tmp) / "postgresql-18.6"
+        (install / "lib").mkdir(parents=True)
+        (install / "bin").mkdir()
+        (install / "lib" / "libLLVM.so.18.1").write_text("")
+        (install / "lib" / "llvmjit.so").write_text("")
+
+        rpath = {"value": "/usr/local/icu/lib:/usr/local/postgresql-18.6/lib"}
+
+        class Result:
+            returncode = 0
+
+            @property
+            def stdout(self):
+                return rpath["value"]
+
+        saved = (p.get_pg_config_setting, p.get_platform,
+                 p.find_system_patchelf, p.subprocess.run)
+        p.get_pg_config_setting = lambda pg_config, flag: None
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+        p.subprocess.run = lambda *a, **kw: Result()
+        try:
+            check("runtime present but rpath never rewritten",
+                  p.llvm_runtime_is_embedded(install), False)
+            rpath["value"] = "$ORIGIN"
+            check("both halves done", p.llvm_runtime_is_embedded(install), True)
+
+            p.find_system_patchelf = lambda: None
+            check("unverifiable counts as unfinished",
+                  p.llvm_runtime_is_embedded(install), False)
+        finally:
+            (p.get_pg_config_setting, p.get_platform,
+             p.find_system_patchelf, p.subprocess.run) = saved
+
+
+def test_an_up_to_date_install_can_still_be_embedded():
+    """Embedding is a file copy and an rpath rewrite -- reaching it must not
+    require rebuilding PostgreSQL. This is also the recovery path after an
+    embed that failed partway (a missing sudo, say), which otherwise leaves an
+    installation depending on a runtime apt can take away."""
+    with tempfile.TemporaryDirectory() as tmp:
+        system_libdir = Path(tmp) / "llvm-18" / "lib"
+        system_libdir.mkdir(parents=True)
+        embedded = {}
+
+        saved = (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+                 p.get_llvm_libdir, p.get_llvm_version, p.llvm_runtime_is_embedded,
+                 p.embed_llvm_runtime, p.prompt_yes_no, p.create_symlink,
+                 p.get_pg_config_setting)
+        p.check_existing = lambda path: True
+        p.check_pg_needs_rebuild = lambda path, flags: []      # nothing to rebuild
+        p.get_platform = lambda: "linux"
+        p.get_llvm_libdir = lambda cfg: system_libdir
+        p.get_llvm_version = lambda cfg: "18.1.3"
+        p.llvm_runtime_is_embedded = lambda path: False        # not yet
+        p.prompt_yes_no = lambda q, default=True: True
+        p.create_symlink = lambda *a, **kw: None
+        p.get_pg_config_setting = lambda pg_config, flag: None
+
+        def fake_embed(pkglibdir, libdir, verbose):
+            embedded["pkglibdir"] = pkglibdir
+            embedded["libdir"] = libdir
+            return True
+
+        p.embed_llvm_runtime = fake_embed
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                result = p.build_postgresql(
+                    "18.6", dry_run=False, with_llvm=True, no_alias=True,
+                    llvm_config="/usr/lib/llvm-18/bin/llvm-config",
+                )
+        finally:
+            (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+             p.get_llvm_libdir, p.get_llvm_version, p.llvm_runtime_is_embedded,
+             p.embed_llvm_runtime, p.prompt_yes_no, p.create_symlink,
+             p.get_pg_config_setting) = saved
+
+    check("embeds without rebuilding", embedded.get("libdir"), system_libdir)
+    check("into the installation's lib dir", embedded.get("pkglibdir"),
+          p.INSTALL_BASE / "postgresql-18.6" / "lib")
+    check("reports the installation as self-contained", result, True)
+    check("no build was run", "Would run: ./configure" in out.getvalue(), False)
+
+
+def test_declining_the_embed_is_reported_as_still_exposed():
+    """Saying no leaves a live system dependency; claiming otherwise would
+    skip the JIT protection offer that is then the only safeguard left."""
+    with tempfile.TemporaryDirectory() as tmp:
+        system_libdir = Path(tmp) / "llvm-18" / "lib"
+        system_libdir.mkdir(parents=True)
+
+        saved = (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+                 p.get_llvm_libdir, p.get_llvm_version, p.llvm_runtime_is_embedded,
+                 p.embed_llvm_runtime, p.prompt_yes_no, p.create_symlink,
+                 p.get_pg_config_setting)
+        p.check_existing = lambda path: True
+        p.check_pg_needs_rebuild = lambda path, flags: []
+        p.get_platform = lambda: "linux"
+        p.get_llvm_libdir = lambda cfg: system_libdir
+        p.get_llvm_version = lambda cfg: "18.1.3"
+        p.llvm_runtime_is_embedded = lambda path: False
+        p.prompt_yes_no = lambda q, default=True: False        # declined
+        p.create_symlink = lambda *a, **kw: None
+        p.get_pg_config_setting = lambda pg_config, flag: None
+        p.embed_llvm_runtime = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("embedded despite being declined"))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = p.build_postgresql(
+                    "18.6", dry_run=False, with_llvm=True, no_alias=True,
+                    llvm_config="/usr/lib/llvm-18/bin/llvm-config",
+                )
+        finally:
+            (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+             p.get_llvm_libdir, p.get_llvm_version, p.llvm_runtime_is_embedded,
+             p.embed_llvm_runtime, p.prompt_yes_no, p.create_symlink,
+             p.get_pg_config_setting) = saved
+
+    check("not reported as self-contained", result, False)
+
+
+def test_system_llvm_runtime_is_embedded_too():
+    """The distro's libLLVM belongs to a package apt retires at the next major
+    version. Embedding only private builds left exactly the dependency
+    --build-llvm exists to avoid -- at an hour of LLVM compilation."""
+    with tempfile.TemporaryDirectory() as tmp:
+        system_libdir = Path(tmp) / "usr" / "lib" / "llvm-18" / "lib"
+        system_libdir.mkdir(parents=True)
+        check("fixture is not a private build",
+              str(system_libdir).startswith(str(p.INSTALL_BASE)), False)
+
+        saved = (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+                 p.get_llvm_libdir, p.get_llvm_version, p.download_and_extract)
+        p.check_existing = lambda path: False
+        p.check_pg_needs_rebuild = lambda path, flags: []
+        p.get_platform = lambda: "linux"
+        p.get_llvm_libdir = lambda cfg: system_libdir
+        p.get_llvm_version = lambda cfg: "18.1.3"
+        p.download_and_extract = lambda url, dest, dry_run: dest
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                p.build_postgresql(
+                    "18.6", dry_run=True, with_llvm=True, no_alias=True,
+                    llvm_config="/usr/lib/llvm-18/bin/llvm-config",
+                )
+        finally:
+            (p.check_existing, p.check_pg_needs_rebuild, p.get_platform,
+             p.get_llvm_libdir, p.get_llvm_version, p.download_and_extract) = saved
+
+    plan = out.getvalue()
+    check("plans to embed the system runtime",
+          f"Would embed the LLVM runtime from {system_libdir}" in plan, True)
+    # A system libdir is already on the loader path; an -rpath into it would
+    # only re-create the dependency being removed.
+    check("no build-time rpath into the system tree",
+          "LLVM rpath" in plan, False)
+
+
+# ---------------------------------------------------------------------------
+# LZ4/Zstandard compression
+# ---------------------------------------------------------------------------
+
+def test_compression_flags_follow_the_postgresql_version():
+    """--with-lz4 landed in PostgreSQL 14, --with-zstd in 15. Passing either to
+    an older configure aborts the build."""
+    saved = p.get_platform
+    p.get_platform = lambda: "linux"
+    try:
+        check("13 gets neither", p.get_compression_configure_flags("13.9"), [])
+        check("14 gets lz4 only", p.get_compression_configure_flags("14.1"), ["--with-lz4"])
+        check("15 gets both", p.get_compression_configure_flags("15.0"),
+              ["--with-lz4", "--with-zstd"])
+        check("18 gets both", p.get_compression_configure_flags("18.6"),
+              ["--with-lz4", "--with-zstd"])
+        # A malformed pin must not crash the build plan.
+        check("unparseable version gets neither",
+              p.get_compression_configure_flags("main"), [])
+    finally:
+        p.get_platform = saved
+
+
+def test_compression_is_linux_only():
+    """macOS does not install liblz4/libzstd here, so configure would fail to
+    find them."""
+    saved = p.get_platform
+    p.get_platform = lambda: "darwin"
+    try:
+        check("darwin gets neither", p.get_compression_configure_flags("18.6"), [])
+    finally:
+        p.get_platform = saved
+
+
+def test_build_postgresql_requires_the_compression_flags():
+    """An existing build predating this change carries neither flag. It has to
+    be recognised as out of date, or the rebuild never happens."""
+    seen = {}
+
+    def fake_check(install_path, required_flags):
+        seen["flags"] = required_flags
+        return []
+
+    saved = (p.check_existing, p.check_pg_needs_rebuild, p.get_platform)
+    p.check_existing = lambda path: True
+    p.check_pg_needs_rebuild = fake_check
+    p.get_platform = lambda: "linux"
+    try:
+        p.build_postgresql("18.6", dry_run=True, no_alias=True)
+    finally:
+        p.check_existing, p.check_pg_needs_rebuild, p.get_platform = saved
+
+    check("--with-lz4 required", "--with-lz4" in seen.get("flags", []), True)
+    check("--with-zstd required", "--with-zstd" in seen.get("flags", []), True)
+
+
+def test_compression_packages_use_real_package_names():
+    """The header check reports Debian names; other distros need translation."""
+    tools = ["liblz4-dev", "libzstd-dev"]
+
+    apt = p.get_package_names_for_tools(tools, "apt")
+    check("apt: liblz4-dev", "liblz4-dev" in apt, True)
+    check("apt: libzstd-dev", "libzstd-dev" in apt, True)
+
+    dnf = p.get_package_names_for_tools(tools, "dnf")
+    check("dnf: lz4-devel", "lz4-devel" in dnf, True)
+    check("dnf: libzstd-devel", "libzstd-devel" in dnf, True)
+    check("dnf: no literal liblz4-dev", "liblz4-dev" in dnf, False)
+
+    pacman = p.get_package_names_for_tools(tools, "pacman")
+    check("pacman: lz4", "lz4" in pacman, True)
+    check("pacman: zstd", "zstd" in pacman, True)
 
 
 # ---------------------------------------------------------------------------
