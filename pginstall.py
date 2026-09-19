@@ -2401,12 +2401,11 @@ def main() -> None:
     ]
     # '--component postgresql --build-llvm' links against a private LLVM that
     # must already exist; only a run that includes the llvm component builds it.
-    building_llvm_now = args.build_llvm and args.component in (None, "llvm")
     for key, label in labels:
         if key in versions:
             note = ""
             if key == "llvm":
-                note = (" (built from source)" if building_llvm_now
+                note = (" (built from source)" if will_build_llvm
                         else " (private toolchain, must already exist)")
             print(f"  {label + ':':<12}{versions[key]}{note}")
     if args.exclude_ast and args.component is None:
@@ -2420,8 +2419,7 @@ def main() -> None:
 
     # Build LLVM before resolving the toolchain, so find_llvm_config() below
     # sees the private build rather than whatever the system happens to offer.
-    building_llvm = args.build_llvm and args.component in (None, "llvm")
-    if building_llvm:
+    if will_build_llvm:
         build_llvm(versions["llvm"], args.dry_run, args.verbose,
                    no_alias=args.no_alias)
 
