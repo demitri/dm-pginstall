@@ -30,6 +30,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -41,6 +42,8 @@ from typing import Optional
 # Constants - match the project conventions
 PG_BASE = Path("/usr/local/postgresql")
 PG_BIN = PG_BASE / "bin"
+# Where this project installs PostgreSQL: /usr/local/postgresql-<version>
+INSTALL_BASE = Path("/usr/local")
 PG_CONFIG_BASE = Path("/etc/postgresql")
 PG_MACOS_CONFIG_BASE = Path("/usr/local/etc/postgresql")
 
@@ -77,6 +80,77 @@ class DatabaseInfo:
 
 
 @dataclass
+class JitInfo:
+    """What a JIT-enabled build actually links against, right now.
+
+    The dependency is invisible to the package manager and the module is loaded
+    lazily, so a broken one shows up as nothing at all until a query crosses
+    jit_above_cost. Reporting it here is the cheap way to notice.
+    """
+    built: bool = False
+    module: Optional[Path] = None
+    soname: Optional[str] = None            # e.g. 'libLLVM.so.18.1'
+    runtime_path: Optional[Path] = None     # where the loader actually finds it
+    resolved: bool = False
+    embedded: bool = False                  # inside this installation's lib dir
+    system_version: Optional[str] = None    # newest llvm-config on the machine
+
+    @property
+    def runtime_version(self) -> Optional[str]:
+        """The major.minor the module was built against, read off the soname."""
+        if not self.soname:
+            return None
+        match = re.search(r"(\d+)\.(\d+)$", self.soname)
+        return f"{match.group(1)}.{match.group(2)}" if match else None
+
+    @property
+    def update_available(self) -> bool:
+        """Is there a newer LLVM on the machine than the one in use?"""
+        current, system = self.runtime_version, self.system_version
+        if not (current and system):
+            return False
+        try:
+            cur = tuple(int(x) for x in current.split(".")[:2])
+            sys_ = tuple(int(x) for x in system.split(".")[:2])
+        except ValueError:
+            return False
+        return sys_ > cur
+
+    def to_dict(self) -> dict:
+        data = {k: (str(v) if isinstance(v, Path) else v)
+                for k, v in self.__dict__.items()}
+        data["runtime_version"] = self.runtime_version
+        data["update_available"] = self.update_available
+        return data
+
+
+@dataclass
+class Installation:
+    """A PostgreSQL build on disk, whether or not anything is running from it.
+
+    Instances (data directories) and installations (binary trees) are different
+    things, and an installation nothing runs from is still a live dependency:
+    its JIT module can be what keeps an old system LLVM pinned on the machine.
+    """
+    version: str
+    path: Path
+    pg_config: Path
+    is_alias_target: bool = False           # what /usr/local/postgresql points at
+    used_by: list[str] = field(default_factory=list)   # instance names
+    jit: Optional[JitInfo] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "version": self.version,
+            "path": str(self.path),
+            "pg_config": str(self.pg_config),
+            "is_alias_target": self.is_alias_target,
+            "used_by": self.used_by,
+            "jit": self.jit.to_dict() if self.jit else None,
+        }
+
+
+@dataclass
 class PostgreSQLInstance:
     """Represents a discovered PostgreSQL instance."""
     name: str
@@ -97,6 +171,7 @@ class PostgreSQLInstance:
     notes: list[str] = field(default_factory=list)
     databases: Optional[list[DatabaseInfo]] = None
     databases_error: Optional[str] = None  # auth failure message, if any
+    jit: Optional[JitInfo] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -104,6 +179,8 @@ class PostgreSQLInstance:
         for k, v in asdict(self).items():
             if k == "databases" and self.databases is not None:
                 result[k] = [db.to_dict() for db in self.databases]
+            elif k == "jit":
+                result[k] = self.jit.to_dict() if self.jit else None
             elif isinstance(v, Path):
                 result[k] = str(v) if v else None
             elif isinstance(v, Enum):
@@ -613,6 +690,118 @@ def get_server_version(pg_ctl_path: Optional[Path]) -> Optional[str]:
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
         pass
     return None
+
+
+# =============================================================================
+# JIT / LLVM runtime inspection
+# =============================================================================
+
+
+def find_llvm_configs() -> list[Path]:
+    """Every llvm-config on this machine, in no particular order."""
+    found = []
+    for pattern in ("/usr/lib/llvm-*/bin/llvm-config",
+                    "/usr/local/llvm-*/bin/llvm-config",
+                    "/opt/homebrew/opt/llvm*/bin/llvm-config",
+                    "/usr/local/opt/llvm*/bin/llvm-config"):
+        base, _, glob = pattern.partition("*")
+        parent = Path(base).parent
+        try:
+            found.extend(p for p in parent.glob(Path(pattern).relative_to(parent).as_posix())
+                         if p.is_file())
+        except (OSError, ValueError):
+            continue
+    on_path = shutil.which("llvm-config")
+    if on_path:
+        found.append(Path(on_path))
+    return found
+
+
+_newest_llvm_version: Optional[str] = None
+_newest_llvm_checked = False
+
+
+def newest_llvm_version() -> Optional[str]:
+    """The highest LLVM version installed, whatever provides it.
+
+    Cached: the answer is a property of the machine, not of an instance, and a
+    listing would otherwise re-run every llvm-config once per instance.
+    """
+    global _newest_llvm_version, _newest_llvm_checked
+    if _newest_llvm_checked:
+        return _newest_llvm_version
+
+    versions = []
+    for llvm_config in find_llvm_configs():
+        try:
+            result = subprocess.run([str(llvm_config), "--version"],
+                                    capture_output=True, text=True, timeout=5)
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            versions.append(result.stdout.strip())
+
+    def key(v: str):
+        parts = []
+        for piece in v.split("."):
+            digits = re.match(r"\d+", piece)
+            parts.append(int(digits.group()) if digits else 0)
+        return tuple(parts)
+
+    _newest_llvm_version = max(versions, key=key) if versions else None
+    _newest_llvm_checked = True
+    return _newest_llvm_version
+
+
+def inspect_jit(pg_ctl_path: Optional[Path]) -> Optional[JitInfo]:
+    """Report what this installation's JIT module links against.
+
+    Resolution is asked of the loader (ldd) rather than assumed from the path:
+    the whole question is which libLLVM would actually be loaded, and an rpath,
+    an ld.so.conf entry or a removed package all change that answer.
+    """
+    if not pg_ctl_path:
+        return None
+
+    pg_config = pg_ctl_path.parent / "pg_config"
+    pkglibdir = None
+    if pg_config.is_file():
+        try:
+            result = subprocess.run([str(pg_config), "--pkglibdir"],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                pkglibdir = Path(result.stdout.strip())
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+            pass
+    if pkglibdir is None:
+        pkglibdir = pg_ctl_path.parent.parent / "lib"
+
+    info = JitInfo(module=pkglibdir / "llvmjit.so")
+    if not info.module.is_file():
+        return info                      # built without --with-llvm
+    info.built = True
+    info.system_version = newest_llvm_version()
+
+    try:
+        result = subprocess.run(["ldd", str(info.module)],
+                                capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        return info                      # no ldd (macOS, or a stripped image)
+
+    for line in result.stdout.splitlines():
+        if "libLLVM" not in line:
+            continue
+        # '\tlibLLVM.so.18.1 => /path/to/libLLVM.so.18.1 (0x...)' or '=> not found'
+        soname, _, rest = line.strip().partition(" => ")
+        info.soname = soname.strip()
+        target = rest.split(" (")[0].strip()
+        if target and target != "not found":
+            info.runtime_path = Path(target)
+            info.resolved = True
+            info.embedded = info.runtime_path.parent == pkglibdir
+        break
+
+    return info
 
 
 def get_latest_postgresql_version() -> Optional[str]:
@@ -1347,6 +1536,214 @@ def enrich_databases(instances: list[PostgreSQLInstance]) -> None:
 # =============================================================================
 
 
+def jit_summary(jit: Optional[JitInfo]) -> Optional[str]:
+    """One line for a listing: what JIT links, and whether that is a problem."""
+    if jit is None:
+        return None
+    if not jit.built:
+        return "not built (configured without --with-llvm)"
+
+    soname = jit.soname or "unknown runtime"
+    if jit.soname and not jit.resolved:
+        return f"{soname} — NOT FOUND, JIT is broken"
+    if jit.embedded:
+        state = f"{soname} (embedded in this installation)"
+    elif jit.resolved:
+        state = f"{soname} (outside this installation)"
+    else:
+        state = soname
+    if jit.update_available:
+        state += f"; LLVM {jit.system_version} available"
+    return state
+
+
+def instance_issues(instance: PostgreSQLInstance) -> list[tuple[str, Optional[str]]]:
+    """Things worth interrupting someone about, as (problem, suggested command).
+
+    Deliberately short of the full note text: this is read at login, where a
+    paragraph is noise and an unactioned warning is worse than none.
+    """
+    issues: list[tuple[str, Optional[str]]] = []
+
+    if instance.stale_postmaster_pid:
+        issues.append((
+            "stale postmaster.pid, but no server is running",
+            f"pgstatus.py start {instance.name}",
+        ))
+
+    jit = instance.jit
+    if jit and jit.built:
+        if jit.soname and not jit.resolved:
+            issues.append((
+                f"JIT is broken: {jit.soname} cannot be found "
+                f"(queries above jit_above_cost fail)",
+                "pginstall.py --component postgresql",
+            ))
+        elif jit.resolved and not jit.embedded:
+            issues.append((
+                "JIT links an LLVM runtime outside this installation; "
+                "a package upgrade can remove it",
+                "pginstall.py --component postgresql",
+            ))
+        if jit.update_available:
+            issues.append((
+                f"LLVM {jit.system_version} is installed, this build uses "
+                f"{jit.runtime_version}",
+                "pginstall.py --component postgresql",
+            ))
+
+    return issues
+
+
+def format_check(instances: list[PostgreSQLInstance],
+                 installations: Optional[list[Installation]] = None
+                 ) -> tuple[str, int]:
+    """The login report: what needs attention, and how many things that is."""
+    blocks = []
+    total = 0
+    for instance in instances:
+        issues = instance_issues(instance)
+        if not issues:
+            continue
+        total += len(issues)
+        where = f"port {instance.port}" if instance.port else instance.status.value
+        blocks.append(f"  {instance.name} ({where}):")
+        for problem, fix in issues:
+            blocks.append(f"    - {problem}")
+            if fix:
+                blocks.append(f"      run: {fix}")
+
+    install_lines = []
+    for install in installations or []:
+        for problem, fix in installation_issues(install, breaking_only=True):
+            total += 1
+            install_lines.append(f"    - {problem}")
+            if fix:
+                install_lines.append(f"      run: {fix}")
+    if install_lines:
+        blocks.append("  installations:")
+        blocks.extend(install_lines)
+
+    if not blocks:
+        return "", 0
+    header = (f"PostgreSQL: {total} thing{'s' if total != 1 else ''} to look at")
+    return "\n".join([header] + blocks), total
+
+
+def discover_installations(instances: Optional[list[PostgreSQLInstance]] = None
+                           ) -> list[Installation]:
+    """Every PostgreSQL build under INSTALL_BASE, newest first.
+
+    Independent of whether anything is running: a build with no instance is
+    invisible to instance discovery, yet still pins whatever its JIT module
+    links against.
+    """
+    alias_target = None
+    if PG_BASE.is_symlink():
+        try:
+            alias_target = PG_BASE.resolve()
+        except OSError:
+            alias_target = None
+
+    found = []
+    for path in sorted(INSTALL_BASE.glob("postgresql-*")):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        pg_config = path / "bin" / "pg_config"
+        if not pg_config.is_file():
+            continue
+        version = path.name.replace("postgresql-", "")
+        install = Installation(
+            version=version,
+            path=path,
+            pg_config=pg_config,
+            is_alias_target=(alias_target == path),
+        )
+        install.jit = inspect_jit(path / "bin" / "pg_ctl")
+        for inst in instances or []:
+            # An instance belongs to the installation its pg_ctl came from,
+            # following the alias so a symlinked pg_ctl is not orphaned.
+            if not inst.pg_ctl_path:
+                continue
+            try:
+                owner = inst.pg_ctl_path.resolve().parent.parent
+            except OSError:
+                continue
+            if owner == path:
+                install.used_by.append(inst.name)
+        found.append(install)
+
+    def version_key(install: Installation):
+        parts = []
+        for piece in install.version.split("."):
+            digits = re.match(r"\d+", piece)
+            parts.append(int(digits.group()) if digits else 0)
+        return parts
+
+    found.sort(key=version_key, reverse=True)
+    return found
+
+
+def installation_issues(install: Installation, breaking_only: bool = False
+                        ) -> list[tuple[str, Optional[str]]]:
+    """Problems with a build on disk, phrased for someone skimming.
+
+    breaking_only is for the login report: a build that links the system LLVM
+    is a fact worth listing in an inventory, but it is not broken, and a daily
+    warning nobody can act on is how people learn to ignore warnings. What does
+    belong there is a runtime that has already gone missing.
+    """
+    issues: list[tuple[str, Optional[str]]] = []
+    jit = install.jit
+    if not (jit and jit.built):
+        return issues
+
+    if jit.soname and not jit.resolved:
+        issues.append((
+            f"{install.path.name}: JIT is broken, {jit.soname} cannot be found",
+            None,
+        ))
+    elif jit.resolved and not jit.embedded and not breaking_only:
+        issues.append((
+            f"{install.path.name}: JIT links the system LLVM "
+            f"({jit.soname}), which must stay installed for this build",
+            "pgjitguard.py status",
+        ))
+    return issues
+
+
+def enrich_jit(instances: list[PostgreSQLInstance]) -> None:
+    """Attach JIT/LLVM state, and say plainly when something is wrong with it.
+
+    Only for detailed views: it shells out per instance, and an instance
+    listing should stay fast.
+    """
+    for instance in instances:
+        info = inspect_jit(instance.pg_ctl_path)
+        instance.jit = info
+        if not info or not info.built:
+            continue
+
+        if info.soname and not info.resolved:
+            instance.notes.append(
+                f"JIT is broken: {info.soname} cannot be found by the loader. "
+                f"The server runs normally until a query costs more than "
+                f"jit_above_cost, which then fails. Rebuild PostgreSQL."
+            )
+        elif info.resolved and not info.embedded:
+            instance.notes.append(
+                f"The LLVM runtime lives outside this installation "
+                f"({info.runtime_path}), so a package upgrade can remove it and "
+                f"break JIT. Rebuilding with pginstall.py embeds a copy; "
+                f"pgjitguard.py can protect it in place instead."
+            )
+        if info.update_available:
+            instance.notes.append(
+                f"LLVM {info.system_version} is installed; this build uses "
+                f"{info.runtime_version}. Rebuild PostgreSQL to use the newer one."
+            )
+
+
 def discover_all_instances(
     extra_paths: Optional[list[Path]] = None,
     check_latest: bool = False,
@@ -1404,6 +1801,51 @@ def discover_all_instances(
     instances.sort(key=lambda i: (status_order.get(i.status, 99), i.name))
 
     return instances
+
+
+def stdin_is_interactive() -> bool:
+    """Is there a person at the other end who can answer a prompt?"""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def choose_instance(instances: list[PostgreSQLInstance]) -> Optional[PostgreSQLInstance]:
+    """Ask which instance was meant, when the answer is not already obvious.
+
+    Returns the chosen instance, or None if the choice cannot be made here --
+    nothing to choose from, or no terminal to ask at (a pipe, a script, or
+    --json output that a prompt would corrupt). Callers print guidance then.
+    """
+    if not instances:
+        return None
+    if len(instances) == 1:
+        return instances[0]
+    if not stdin_is_interactive():
+        return None
+
+    print("Which instance?\n")
+    for i, inst in enumerate(instances, start=1):
+        detail = f"{inst.status.value}, port {inst.port}" if inst.port else inst.status.value
+        print(f"  {i}. {inst.name}  ({detail})")
+    print()
+
+    while True:
+        try:
+            answer = input(f"Select [1-{len(instances)}], or q to quit: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if answer.lower() in ("q", "quit", "exit", ""):
+            return None
+        # A name is as good an answer as a number, and likelier to be typed.
+        by_name = resolve_instance(answer, instances)
+        if by_name:
+            return by_name
+        if answer.isdigit() and 1 <= int(answer) <= len(instances):
+            return instances[int(answer) - 1]
+        print(f"  Not one of the choices: {answer}")
 
 
 def resolve_instance(name: str, instances: list[PostgreSQLInstance]) -> Optional[PostgreSQLInstance]:
@@ -1646,6 +2088,60 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     return "\n".join(lines)
 
 
+def jit_column(jit: Optional[JitInfo]) -> str:
+    """The JIT state, short enough for a table cell."""
+    if jit is None:
+        return "-"
+    if not jit.built:
+        return "none"
+    if jit.soname and not jit.resolved:
+        return f"BROKEN ({jit.soname} not found)"
+    if jit.embedded:
+        return f"embedded ({jit.soname})"
+    return f"system ({jit.soname})"
+
+
+def format_installations_table(installations: list[Installation]) -> str:
+    """Format the builds on disk, running or not."""
+    if not installations:
+        return ""
+
+    headers = ["Version", "Path", "Alias", "In use by", "JIT"]
+    rows = []
+    for install in installations:
+        rows.append([
+            install.version,
+            str(install.path),
+            "yes" if install.is_alias_target else "-",
+            ", ".join(install.used_by) if install.used_by else "-",
+            jit_column(install.jit),
+        ])
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    lines = ["Installations:"]
+    lines.append("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+    notes = []
+    for install in installations:
+        for problem, fix in installation_issues(install):
+            notes.append(f"  {problem}")
+            if fix:
+                notes.append(f"    run: {fix}")
+    if notes:
+        lines.append("")
+        lines.append("Notes:")
+        lines.extend(notes)
+
+    return "\n".join(lines)
+
+
 def format_list_json(instances: list[PostgreSQLInstance]) -> str:
     """Format instances as JSON."""
     return json.dumps([i.to_dict() for i in instances], indent=2)
@@ -1704,6 +2200,10 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             lines.append(f"    Env File:    {inst.env_file}")
         if inst.log_file:
             lines.append(f"    Log:         {inst.log_file}")
+
+        summary = jit_summary(inst.jit)
+        if summary:
+            lines.append(f"    JIT (LLVM):  {summary}")
 
         # Commands
         start_cmd = get_start_command(inst)
@@ -1805,6 +2305,28 @@ def format_info(instance: PostgreSQLInstance) -> str:
         lines.append(f"  Status:      systemctl status {instance.service_name}")
         lines.append(f"  Logs:        journalctl -u {instance.service_name}")
 
+    # JIT section (shown when enriched via 'info')
+    if instance.jit is not None:
+        jit = instance.jit
+        lines.append("")
+        lines.append("JIT (LLVM):")
+        if not jit.built:
+            lines.append("  Module:      not built (configured without --with-llvm)")
+        else:
+            lines.append(f"  Module:      {jit.module}")
+            lines.append(f"  Runtime:     {jit.soname or 'unknown'}")
+            if jit.resolved:
+                where = ("embedded in this installation" if jit.embedded
+                         else "outside this installation; a package upgrade can remove it")
+                lines.append(f"  Resolved:    {jit.runtime_path} ({where})")
+            elif jit.soname:
+                lines.append(f"  Resolved:    NOT FOUND — JIT is broken")
+            if jit.system_version:
+                installed = f"  Installed:   LLVM {jit.system_version}"
+                if jit.update_available:
+                    installed += f" (newer than the {jit.runtime_version} in use)"
+                lines.append(installed)
+
     # Databases section (shown when enriched via 'databases' command)
     if instance.databases is not None or instance.databases_error:
         lines.extend(_format_databases_block(instance, indent="  "))
@@ -1845,7 +2367,7 @@ _pgstatus_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="list databases info start stop restart"
+    commands="list check installations databases info start stop restart"
 
     case "${prev}" in
         databases|info|start|stop|restart)
@@ -1888,6 +2410,8 @@ _pgstatus() {
     local -a commands instances
     commands=(
         'list:List all PostgreSQL instances'
+        'check:Report only what needs attention (for login shells)'
+        'installations:List PostgreSQL builds on disk, running or not'
         'databases:List databases in each running instance'
         'info:Show detailed info about an instance'
         'start:Start an instance'
@@ -1937,6 +2461,8 @@ Examples:
   %(prog)s list                 # List all instances
   %(prog)s list --expand        # List with full details and commands
   %(prog)s list --json          # List as JSON
+  %(prog)s check                # Print only what needs attention (for login)
+  %(prog)s installations        # List PostgreSQL builds on disk, running or not
   %(prog)s databases            # List instances with their databases
   %(prog)s databases main       # Databases for a specific instance
   %(prog)s info main            # Show detailed info for 'main' instance
@@ -1954,7 +2480,8 @@ systemd-managed instances.
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["list", "databases", "info", "start", "stop", "restart"],
+        choices=["list", "check", "installations", "databases", "info",
+                 "start", "stop", "restart"],
         default="list",
         help="Command to run (default: list)",
     )
@@ -2009,17 +2536,63 @@ def main() -> int:
 
     # Discover instances
     extra_paths = [Path(p) for p in args.pgdata] if args.pgdata else None
+    # 'check' deliberately skips the upstream version query: it is meant for
+    # login shells, where reaching the network is a hang waiting to happen.
     check_latest = args.command in ("list", "databases", "info")
     instances = discover_all_instances(extra_paths=extra_paths, check_latest=check_latest)
 
     # Handle commands
-    if args.command == "list":
+    if args.command == "check":
+        enrich_jit(instances)
+        # Builds with nothing running are still worth reporting: an idle one
+        # can be the reason an old system LLVM cannot be removed.
+        installations = discover_installations(instances)
         if args.json:
+            payload = {
+                "issues": {i.name: [{"problem": p, "run": fix}
+                                    for p, fix in instance_issues(i)]
+                           for i in instances if instance_issues(i)},
+                "installations": {
+                    str(inst.path): [
+                        {"problem": p, "run": fix}
+                        for p, fix in installation_issues(inst, breaking_only=True)]
+                    for inst in installations
+                    if installation_issues(inst, breaking_only=True)},
+            }
+            print(json.dumps(payload, indent=2))
+            return 1 if (payload["issues"] or payload["installations"]) else 0
+        report, count = format_check(instances, installations)
+        if report:
+            print(report)
+        return 1 if count else 0
+
+    if args.command == "installations":
+        installations = discover_installations(instances)
+        if args.json:
+            print(json.dumps([i.to_dict() for i in installations], indent=2))
+        elif not installations:
+            print(f"No PostgreSQL installations found under {INSTALL_BASE}.")
+        else:
+            print(format_installations_table(installations))
+        return 0
+
+    if args.command == "list":
+        if args.json or args.expand:
+            # Detail views report JIT state; the plain table has no room for it.
+            enrich_jit(instances)
+        if args.json:
+            # Shape kept as an array of instances for existing consumers;
+            # 'installations --json' carries the builds on disk.
             print(format_list_json(instances))
-        elif args.expand:
+            return 0
+        if args.expand:
             print(format_list_expanded(instances))
         else:
             print(format_list_table(instances))
+        installations = format_installations_table(discover_installations(instances))
+        if installations:
+            print()
+            print(installations)
         return 0
 
     elif args.command == "databases":
@@ -2033,11 +2606,14 @@ def main() -> int:
                 if instances:
                     print(f"Available instances: {', '.join(i.name for i in instances)}", file=sys.stderr)
                 return 1
+            enrich_jit([instance])
             if args.json:
                 print(format_info_json(instance))
             else:
                 print(format_info(instance))
         else:
+            if args.json or args.expand:
+                enrich_jit(instances)
             if args.json:
                 print(format_list_json(instances))
             elif args.expand:
@@ -2048,8 +2624,23 @@ def main() -> int:
 
     elif args.command == "info":
         if not args.instance:
-            print("Error: Instance name required for 'info' command.", file=sys.stderr)
-            return 1
+            # One instance needs no disambiguating; several can be picked from,
+            # as long as this is a terminal and not a pipe feeding JSON.
+            chosen = None if args.json else choose_instance(instances)
+            if not chosen:
+                print("Error: Instance name required for 'info' command.",
+                      file=sys.stderr)
+                if instances:
+                    print(f"  Available: {', '.join(i.name for i in instances)}",
+                          file=sys.stderr)
+                    print(f"  For example: {Path(sys.argv[0]).name} info "
+                          f"{instances[0].name}", file=sys.stderr)
+                    print(f"  To see them all: {Path(sys.argv[0]).name} list",
+                          file=sys.stderr)
+                else:
+                    print("  No instances were found to describe.", file=sys.stderr)
+                return 1
+            args.instance = chosen.name
 
         instance = resolve_instance(args.instance, instances)
         if not instance:
@@ -2057,6 +2648,8 @@ def main() -> int:
             if instances:
                 print(f"Available instances: {', '.join(i.name for i in instances)}", file=sys.stderr)
             return 1
+
+        enrich_jit([instance])
 
         if args.json:
             print(format_info_json(instance))
