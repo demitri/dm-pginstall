@@ -210,6 +210,24 @@ def make_llvm_tree(base, with_clang=True, with_runtime=True):
     return base
 
 
+def test_find_llvm_runtime_libs_excludes_the_c_api_wrapper():
+    with tempfile.TemporaryDirectory() as tmp:
+        libdir = Path(tmp)
+        (libdir / "libLLVM.so.23.1").write_text("")
+        (libdir / "libLLVM-C.so.23.1").write_text("")
+        found = [f.name for f in p.find_llvm_runtime_libs(libdir)]
+        check("real runtime found", "libLLVM.so.23.1" in found, True)
+        check("C API wrapper excluded", "libLLVM-C.so.23.1" in found, False)
+
+
+def test_find_llvm_runtime_libs_ignores_dangling_symlinks():
+    with tempfile.TemporaryDirectory() as tmp:
+        libdir = Path(tmp)
+        (libdir / "libLLVM.so.23.1").symlink_to(libdir / "does-not-exist")
+        check("dangling symlink not returned",
+              p.find_llvm_runtime_libs(libdir), [])
+
+
 def test_complete_llvm_install_is_recognised():
     with tempfile.TemporaryDirectory() as tmp:
         tree = make_llvm_tree(Path(tmp) / "llvm-23.1.0")
@@ -229,6 +247,104 @@ def test_partial_llvm_install_is_rejected():
 
         check("empty directory rejected",
               p.llvm_install_is_complete(Path(tmp) / "nonexistent"), False)
+
+
+# ---------------------------------------------------------------------------
+# Is the private LLVM runtime embedded into the PostgreSQL install?
+# ---------------------------------------------------------------------------
+
+def _embed_test_setup(tmp, with_llvmjit=True, with_runtime_lib=True):
+    pkglibdir = Path(tmp) / "pkglibdir"
+    pkglibdir.mkdir()
+    if with_llvmjit:
+        (pkglibdir / "llvmjit.so").write_text("")
+    llvm_libdir = Path(tmp) / "llvm-23.1.0" / "lib"
+    llvm_libdir.mkdir(parents=True)
+    if with_runtime_lib:
+        (llvm_libdir / "libLLVM.so.23.1").write_text("")
+    return pkglibdir, llvm_libdir
+
+
+def test_embed_skips_on_darwin():
+    """patchelf's rpath rewriting is ELF-specific; on macOS the build-time
+    absolute rpath (install_name) must be left alone, not overwritten."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        saved = (p.get_platform, p.run_build_cmd)
+        p.get_platform = lambda: "darwin"
+        p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("run_build_cmd called on darwin"))
+        try:
+            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            p.get_platform, p.run_build_cmd = saved
+
+
+def test_embed_warns_without_acting_when_llvmjit_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp, with_llvmjit=False)
+        saved = (p.get_platform, p.run_build_cmd)
+        p.get_platform = lambda: "linux"
+        p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("run_build_cmd called with no llvmjit.so present"))
+        try:
+            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            p.get_platform, p.run_build_cmd = saved
+
+
+def test_embed_warns_without_acting_when_no_runtime_lib():
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp, with_runtime_lib=False)
+        saved = (p.get_platform, p.run_build_cmd)
+        p.get_platform = lambda: "linux"
+        p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("run_build_cmd called with no runtime library present"))
+        try:
+            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            p.get_platform, p.run_build_cmd = saved
+
+
+def test_embed_warns_without_acting_when_patchelf_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd)
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: None
+        p.run_build_cmd = lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("run_build_cmd called with no patchelf available"))
+        try:
+            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            p.get_platform, p.find_system_patchelf, p.run_build_cmd = saved
+
+
+def test_embed_copies_runtime_and_rpaths_to_origin():
+    """The whole point: llvmjit.so ends up carrying its own copy of the LLVM
+    runtime, rpathed to $ORIGIN, so deleting the private LLVM tree later can't
+    silently break JIT the way a retired system LLVM does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pkglibdir, llvm_libdir = _embed_test_setup(tmp)
+        calls = []
+        saved = (p.get_platform, p.find_system_patchelf, p.run_build_cmd)
+        p.get_platform = lambda: "linux"
+        p.find_system_patchelf = lambda: "/usr/bin/patchelf"
+        p.run_build_cmd = lambda cmd, **kw: calls.append(cmd)
+        try:
+            p.embed_private_llvm_runtime(pkglibdir, llvm_libdir, verbose=False)
+        finally:
+            p.get_platform, p.find_system_patchelf, p.run_build_cmd = saved
+
+        copy_calls = [c for c in calls if c[:2] == ["sudo", "cp"]]
+        patch_calls = [c for c in calls if "patchelf" in c[0]]
+        check("copies the runtime library", len(copy_calls), 1)
+        check("copy source is the private LLVM's lib", copy_calls[0][3],
+              str(llvm_libdir / "libLLVM.so.23.1"))
+        check("copy destination is pkglibdir", copy_calls[0][4],
+              str(pkglibdir / "libLLVM.so.23.1"))
+        check("patchelf sets rpath to $ORIGIN", patch_calls[0][1:],
+              ["--set-rpath", "$ORIGIN", str(pkglibdir / "llvmjit.so")])
 
 
 def test_incomplete_private_build_is_not_selected():
@@ -354,6 +470,65 @@ def test_postgresql_component_with_build_llvm_resolves_the_llvm_version():
     finally:
         for name, fn in saved.items():
             setattr(p, name, fn)
+
+
+def test_skip_extensions_avoids_their_upstream_queries():
+    """A full run with --skip-extensions never builds q3c/ast/pgast, so it must
+    not depend on their upstreams being reachable either."""
+    saved = {}
+    for name in ("get_latest_q3c_version", "get_latest_ast_version",
+                 "get_latest_pgast_version"):
+        saved[name] = getattr(p, name)
+        setattr(p, name, lambda: (_ for _ in ()).throw(
+            AssertionError("skipped extension's upstream queried")))
+    saved["get_latest_openssl_version"] = p.get_latest_openssl_version
+    saved["get_latest_icu_version"] = p.get_latest_icu_version
+    saved["get_latest_postgresql_version"] = p.get_latest_postgresql_version
+    saved["get_latest_readline_version"] = p.get_latest_readline_version
+    p.get_latest_openssl_version = lambda: "3.6.1"
+    p.get_latest_icu_version = lambda: "76.1"
+    p.get_latest_postgresql_version = lambda: "18.6"
+    p.get_latest_readline_version = lambda: "8.2"  # only queried on macOS
+
+    try:
+        versions = p.load_versions(None, skip_extensions=True)
+        expected = ["icu", "openssl", "postgresql"]
+        if p.get_platform() == "darwin":
+            expected.append("readline")
+        check("no q3c/ast/pgast when skipped", sorted(versions), sorted(expected))
+
+        # An explicit '--component q3c' still wins over --skip-extensions,
+        # matching the dispatch in main() that builds it regardless.
+        p.get_latest_q3c_version = lambda: "2.0.1"
+        explicit = p.load_versions(None, skip_extensions=True, component="q3c")
+        check("explicit component overrides --skip-extensions",
+              explicit.get("q3c"), "2.0.1")
+    finally:
+        for name, fn in saved.items():
+            setattr(p, name, fn)
+
+
+def test_existing_private_llvm_config_rejects_a_system_toolchain():
+    """Regression: '--component postgresql --build-llvm' used to require
+    load_versions()'s network-detected *latest* LLVM release to exist on disk,
+    breaking every run once upstream shipped a newer release than what was
+    actually built. It must discover whatever private LLVM exists instead --
+    but never accept a system one as a substitute."""
+    saved = (p.find_llvm_config, p.INSTALL_BASE)
+    p.INSTALL_BASE = Path("/usr/local")
+    try:
+        p.find_llvm_config = lambda: "/usr/local/llvm-20.1.8/bin/llvm-config"
+        check("private build accepted", p.find_existing_private_llvm_config(),
+              "/usr/local/llvm-20.1.8/bin/llvm-config")
+
+        p.find_llvm_config = lambda: "/usr/bin/llvm-config"
+        check("system toolchain rejected",
+              p.find_existing_private_llvm_config(), None)
+
+        p.find_llvm_config = lambda: None
+        check("nothing found is None", p.find_existing_private_llvm_config(), None)
+    finally:
+        p.find_llvm_config, p.INSTALL_BASE = saved
 
 
 def test_shared_runtime_must_be_a_real_file():
