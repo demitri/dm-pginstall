@@ -7,7 +7,7 @@ A Python-based installer that automates building PostgreSQL and its dependencies
 - **Latest versions**: Get the newest PostgreSQL, ICU, and extensions without waiting for package managers
 - **Consistent paths**: All components install to `/usr/local/<package>-<version>` with predictable symlinks
 - **Full control**: Pin specific versions or always use the latest
-- **JIT support**: Automatically enables LLVM JIT compilation when available
+- **JIT support**: Automatically enables LLVM JIT compilation when available, with the LLVM runtime copied into the installation so package upgrades cannot break it
 - **Astronomy extensions**: Includes q3c and pgast for spatial/WCS queries
 
 ## Quick Start
@@ -66,8 +66,8 @@ For JIT support (optional but recommended):
 sudo apt install llvm-dev clang
 ```
 
-To build a private LLVM instead (`--build-llvm`), which is immune to distro LLVM
-upgrades:
+The runtime is copied into the PostgreSQL installation, so a later distro LLVM
+upgrade cannot break JIT. To build a private LLVM instead (`--build-llvm`):
 ```bash
 sudo apt install cmake ninja-build g++
 ```
@@ -153,11 +153,11 @@ Options:
 # Use a config file for version pinning
 ./pginstall.py --config pginstall.conf
 
-# Build a private LLVM so distro upgrades can never break JIT
+# Build a private LLVM (only needed when the distro's is unusable)
 ./pginstall.py --build-llvm
 ```
 
-### Building a private LLVM
+### The embedded LLVM runtime
 
 PostgreSQL built with `--with-llvm` links `llvmjit.so` against a specific
 versioned LLVM runtime. When that runtime is the *system* LLVM, the package
@@ -165,10 +165,61 @@ manager has no record of the dependency, so a distribution upgrade can retire it
 and break JIT — silently, since the module is loaded lazily and only queries
 above `jit_above_cost` fail.
 
-`--build-llvm` removes the failure mode instead of guarding against it. LLVM and
-clang are built from source into `/usr/local/llvm-<version>`, PostgreSQL is
-linked against that, and an rpath is baked in so `llvmjit.so` finds it at
-runtime. Nothing the package manager does can touch it.
+Every JIT-enabled Linux build therefore **copies the LLVM runtime into the
+installation's `lib/` directory** and rewrites `llvmjit.so`'s rpath to
+`$ORIGIN`, so it loads the copy beside it rather than anything on the system
+loader path. The dependency leaves the package manager's world entirely: apt can
+upgrade, downgrade or remove its LLVM without touching this installation, and
+the copy stays on the exact LLVM version the bitcode was compiled against.
+
+This applies to the distro's LLVM (`apt install llvm-dev clang`) as well as a
+private one — the library is a file, and placing it takes a second, not the hour
+a source build takes.
+
+When the LLVM runtime and the PostgreSQL installation are on one filesystem it
+is **hard-linked**, not copied, so it costs no additional disk space. That is
+safe because package managers replace a file by writing a new one and renaming
+it over the old name: the link keeps pointing at the original inode, so the
+runtime PostgreSQL was built against stays intact and stays reachable even after
+apt upgrades or removes its own copy. (`du` will attribute the ~120 MB to
+whichever copy it sees first; the blocks are shared until the last link goes.)
+Across filesystems inodes cannot be shared, so a real copy is made instead.
+
+Either way the installation stops receiving the distro's LLVM security updates
+for that runtime, which is the deliberate trade: silently swapping the runtime
+under a built JIT is the failure being prevented.
+
+A build reports what it did:
+
+```
+  Would embed the LLVM runtime from /usr/lib/llvm-18/lib into pkglibdir (self-contained install)
+```
+
+One caveat: if `/usr/local/postgresql/lib` is added to the system loader path
+(`/etc/ld.so.conf.d/`, as some setups do for `libpq`), the embedded copy becomes
+visible to every program that needs that LLVM soname, not just PostgreSQL. It is
+a copy of the same library, so nothing changes until the distro moves on — after
+which those programs would find the older copy first. Keep the directory out of
+the loader cache, or rely on the rpath that `psql` and friends already carry.
+
+If embedding cannot be completed — no `patchelf`, or no runtime library where
+`llvm-config --libdir` points — the build says so and falls back to the live
+system dependency, and the JIT protection step below offers to guard it instead.
+
+### Building a private LLVM
+
+On Linux, with the runtime embedded, a private LLVM is no longer needed to
+survive distro upgrades. `--build-llvm` remains useful when the distribution
+ships no usable LLVM, when its LLVM is too old or too new for the PostgreSQL
+being built, or when a specific LLVM version is wanted. LLVM and clang are built
+from source into `/usr/local/llvm-<version>`, PostgreSQL is linked against that,
+and the runtime is embedded from there in the same way.
+
+**On macOS it still earns its keep.** Embedding is Linux-only — it relies on
+`patchelf`, which is ELF-specific — so a build against a Homebrew LLVM keeps a
+live dependency on `/opt/homebrew/opt/llvm`, and `brew upgrade llvm` can move
+the runtime out from under `llvmjit.so`. `--build-llvm` puts LLVM somewhere
+Homebrew does not manage, which is the same independence by a different route.
 
 ```bash
 # Build LLVM, then PostgreSQL against it (implies --with-llvm)
@@ -243,8 +294,17 @@ Discovers and manages PostgreSQL instances on Linux and macOS. Supports systemd 
 # List as JSON
 ./pgstatus.py list --json
 
-# Show detailed info for an instance
+# Show detailed info for an instance (includes JIT/LLVM state)
 ./pgstatus.py info main
+
+# Or just 'info': with one instance it is used, with several you are asked
+./pgstatus.py info
+
+# Report only what needs attention (silent when all is well)
+./pgstatus.py check
+
+# List PostgreSQL builds on disk, whether or not anything runs from them
+./pgstatus.py installations
 
 # Start/stop/restart an instance
 ./pgstatus.py start main
@@ -279,6 +339,12 @@ dev       stopped  5433   17.2     /usr/local/postgresql/data/dev
 ### pgjitguard.py (Linux only)
 
 Protects a JIT-enabled build against system LLVM upgrades.
+
+> Builds made by current `pginstall.py` embed the LLVM runtime (see [The
+> embedded LLVM runtime](#the-embedded-llvm-runtime)) and have no system LLVM
+> dependency left to protect. This tool covers the installations that do: builds
+> made before that change, builds where embedding could not be completed, and
+> PostgreSQL installed by other means.
 
 PostgreSQL built with `--with-llvm` produces `llvmjit.so`, which links against a
 specific versioned LLVM runtime (e.g. `libLLVM.so.20.1`). The package manager has
@@ -329,7 +395,10 @@ normally.
 > JIT module is not a good trade, and the generated package achieves the same
 > protection without it.
 
-`pginstall.py` offers to run `protect` after any JIT-enabled build.
+`pginstall.py` runs this step after any JIT-enabled build. When the runtime was
+embedded it reports that there is nothing to protect and only cleans up a pin
+left from before; when a live system dependency remains, it offers to protect
+it.
 
 **After rebuilding PostgreSQL against a newer LLVM**, re-run `sudo ./pgjitguard.py
 protect`. It re-derives the dependency set from the rebuilt module, protects the
@@ -345,7 +414,8 @@ Options:
 `protect` refuses to run against a module whose dependencies are already
 unresolved — doing so would record the wrong set. Rebuild first, then protect.
 
-If no dpkg package owns the LLVM runtime — the case after
+If no dpkg package owns the LLVM runtime — the case once the runtime is
+[embedded](#the-embedded-llvm-runtime), and after
 [`--build-llvm`](#building-a-private-llvm) — every command reports that there is
 nothing to protect, because no apt operation can remove it. A pin left over from
 before the switch is then rebuilt around whatever the *remaining* installations
@@ -357,9 +427,109 @@ need, or removed outright if none do.
 > one does not unprotect another. An installation that cannot be inspected is
 > reported and treated as still needing protection.
 
-Run `./test_pgjitguard.py` and `./test_pginstall.py` to exercise the parsing,
-drift-detection, and LLVM toolchain-selection logic. Both use recorded fixtures
-and need no dpkg, apt, LLVM, network, or running PostgreSQL.
+Run `./test_pgjitguard.py`, `./test_pginstall.py` and `./test_pgstatus.py` to
+exercise the parsing, drift-detection, LLVM toolchain-selection and JIT
+reporting logic. All three use recorded fixtures and need no dpkg, apt, LLVM,
+network, or running PostgreSQL.
+
+#### Installations vs instances
+
+An *instance* is a data directory with a server; an *installation* is a build
+under `/usr/local/postgresql-<version>`. They are not the same, and a build that
+nothing runs from is still a live dependency — its JIT module can be the reason
+an old system LLVM cannot be removed. `list` shows both, and `installations`
+shows just the builds:
+
+```
+Installations:
+Version  Path                         Alias  In use by  JIT
+-------  ---------------------------  -----  ---------  --------------------------
+18.6     /usr/local/postgresql-18.6   yes    18         embedded (libLLVM.so.18.1)
+12.22    /usr/local/postgresql-12.22  -      -          system (libLLVM.so.18.1)
+12.20    /usr/local/postgresql-12.20  -      -          system (libLLVM.so.18.1)
+```
+
+`Alias` marks what `/usr/local/postgresql` points at, `In use by` names the
+instances running from that build, and `JIT` says whether the LLVM runtime is
+embedded (nothing can take it away), comes from the system (a package must stay
+installed for it), or is missing (JIT is already broken). `installations --json`
+gives the same in machine-readable form.
+
+#### Reporting on login
+
+`check` prints nothing when everything is in order, and a short actionable
+block when it is not:
+
+```
+PostgreSQL: 2 things to look at
+  18 (port 5432):
+    - stale postmaster.pid, but no server is running
+      run: pgstatus.py start 18
+    - JIT links an LLVM runtime outside this installation; a package upgrade can remove it
+      run: pginstall.py --component postgresql
+```
+
+It exits 0 when it printed nothing and 1 when it printed something, so it can
+gate a script or a timer. It reports breakage, not inventory: an idle build that
+links the system LLVM is shown by `installations`, not warned about at every
+login, while a runtime that has actually gone missing is reported either way. It makes no network calls (unlike `list`, which checks for a newer PostgreSQL
+upstream) and takes about 0.4s.
+
+**Put it where login shells run, not where every shell runs.** `~/.bashrc` and
+`~/.zshrc` are read by each new terminal, tmux pane and subshell; the login
+files are read once per session:
+
+```bash
+# ~/.bash_profile (bash), ~/.zprofile (zsh), or ~/.profile
+/path/to/pgstatus.py check
+```
+
+> bash reads `~/.bash_profile` if it exists and falls back to `~/.profile`
+> otherwise — so if you have only `~/.profile`, that is the file to edit, and
+> adding a `~/.bash_profile` would stop the other one being read.
+
+System-wide, `/etc/profile.d/*.sh` is sourced by login shells only (and by zsh
+too, where Debian and Ubuntu's `/etc/zsh/zprofile` pulls in `/etc/profile`):
+
+```bash
+# /etc/profile.d/pgstatus.sh
+/usr/local/bin/pgstatus.py check
+```
+
+On a server reached over SSH, the dynamic MOTD is the tidiest home — it runs
+once per login, before the prompt, and nothing prints when there is nothing to
+say:
+
+```bash
+# /etc/update-motd.d/99-pgstatus   (chmod +x, runs as root)
+#!/bin/sh
+exec /usr/local/bin/pgstatus.py check
+```
+
+For a machine-readable form, `check --json` returns the same issues keyed by
+instance, plus any broken installations.
+
+#### JIT/LLVM state
+
+`info` reports what the JIT module actually links against, because that
+dependency is invisible to the package manager and fails silently when it
+breaks:
+
+```
+JIT (LLVM):
+  Module:      /usr/local/postgresql-18.6/lib/llvmjit.so
+  Runtime:     libLLVM.so.18.1
+  Resolved:    /usr/local/postgresql-18.6/lib/libLLVM.so.18.1 (embedded in this installation)
+  Installed:   LLVM 20.1.2 (newer than the 18.1 in use)
+```
+
+The same state appears as a one-line summary in `list --expand` and in
+`list --json`. Resolution is asked of the loader (`ldd`), not guessed from the path, since an
+rpath, an `ld.so.conf` entry or a removed package all change the answer. A note
+is added when the runtime resolves outside the installation (a package upgrade
+can remove it), when it cannot be resolved at all (JIT is already broken, and
+only queries above `jit_above_cost` will show it), and when a newer LLVM is
+installed than the one PostgreSQL was built against.
 
 ### create_pg_service.py (Linux only)
 
