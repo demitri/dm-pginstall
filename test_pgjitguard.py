@@ -270,7 +270,7 @@ def test_uninspectable_sibling_blocks_pin_removal():
         current.has_jit = True
 
         def explode(pg_config):
-            raise SystemExit(2)
+            raise g.JitInspectionError(f"could not inspect {pg_config}")
 
         restore = stub(INSTALL_BASE=base, JitState=explode)
         try:
@@ -303,7 +303,7 @@ def test_uninspectable_sibling_keeps_its_dependencies_in_a_rebuilt_pin():
 
         def inspect(pg_config):
             if Path(pg_config).resolve() == broken.resolve():
-                raise SystemExit(2)
+                raise g.JitInspectionError(f"could not inspect {pg_config}")
             return Known()
 
         restore = stub(INSTALL_BASE=base, JitState=inspect,
@@ -347,8 +347,20 @@ def test_private_sibling_does_not_block_pin_removal():
 # ---------------------------------------------------------------------------
 
 def test_pin_version_bump_is_monotonic():
-    for current, want in [(None, "1.1"), ("1.1", "1.2"), ("1.9", "1.10"),
-                          ("1.42", "1.43"), ("nonsense", "1.1")]:
+    """Regression: a current version outside the known "1.N" scheme used to
+    fall back to a hardcoded "1.1" -- a silent downgrade if the real current
+    version sorted higher (e.g. after an epoch was ever introduced)."""
+    for current, want in [
+        (None, "1.1"), ("1.1", "1.2"), ("1.9", "1.10"), ("1.42", "1.43"),
+        # Unparseable, no epoch: bump into epoch 1, which always outranks an
+        # implicit epoch 0 regardless of the unparseable content.
+        ("nonsense", "1:1.1"),
+        # Already in an epoch matching the "1.N" scheme: keep incrementing
+        # within it, rather than getting stuck re-emitting the same value.
+        ("1:1.1", "1:1.2"), ("2:1.5", "2:1.6"),
+        # Epoched but unparseable upstream part: bump the epoch itself.
+        ("3:garbage", "4:1.1"),
+    ]:
         restore = stub(installed_pin_version=lambda c=current: c)
         try:
             check(f"next_pin_version({current!r})", g.next_pin_version(), want)
@@ -361,6 +373,11 @@ def test_pin_version_bump_is_monotonic():
 # ---------------------------------------------------------------------------
 
 def test_installed_pin_depends_strips_versions_and_alternatives():
+    # installed_pin_depends() is lru_cache'd (see pgjitguard.py); this is the
+    # only test that calls the real function rather than stubbing it out, but
+    # clear the cache anyway so a future test doing the same is not silently
+    # handed this test's cached result.
+    g.installed_pin_depends.cache_clear()
     restore = stub(
         run=lambda cmd, check=True: (0, "libllvm21 (>= 1:21~), libc6 | libc6-udeb, libstdc++6", ""),
     )
@@ -372,6 +389,7 @@ def test_installed_pin_depends_strips_versions_and_alternatives():
     finally:
         g.shutil.which = saved_which
         restore()
+        g.installed_pin_depends.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +400,23 @@ def rendered_hook():
     return g.APT_HOOK_TEMPLATE.format(
         script="/usr/local/sbin/pgjitguard",
         pg_config="/usr/local/postgresql-18.1/bin/pg_config",
+        fingerprint="0" * 16,
     )
+
+
+def test_unsafe_apt_conf_chars_rejects_backslash_too():
+    """Regression: only ' and " were refused, but apt.conf's own parser
+    processes backslash escapes in a double-quoted value before the shell
+    ever sees it -- a path containing one is not just shell-unsafe."""
+    check("plain path is safe",
+          g.has_unsafe_apt_conf_chars(Path("/usr/local/postgresql-18.1/bin/pg_config")),
+          False)
+    check("single quote unsafe",
+          g.has_unsafe_apt_conf_chars(Path("/tmp/it's/bin/pg_config")), True)
+    check("double quote unsafe",
+          g.has_unsafe_apt_conf_chars(Path('/tmp/a"b/bin/pg_config')), True)
+    check("backslash unsafe",
+          g.has_unsafe_apt_conf_chars(Path("/tmp/a\\b/bin/pg_config")), True)
 
 
 def test_apt_hook_stays_valid_apt_conf():
@@ -422,6 +456,44 @@ def test_apt_hook_command_actually_parses():
     check("hook sets --quiet", args.quiet, True)
     check("hook names the installation", args.pg_config,
           "/usr/local/postgresql-18.1/bin/pg_config")
+
+
+def test_stale_hook_warning():
+    """Regression: install-hook recorded no version, so a repo update never
+    reached the installed copy under /usr/local/sbin until someone remembered
+    to re-run install-hook -- and nothing said so in the meantime."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        running = base / "pgjitguard.py"
+        running.write_text("print('v1')\n")
+        installed = base / "installed" / "pgjitguard"
+        installed.parent.mkdir()
+        installed.write_text("print('v1')\n")
+        hook_file = base / "99-pgjitguard"
+
+        saved = (g.__file__, g.INSTALLED_SCRIPT, g.APT_HOOK_FILE)
+        g.__file__ = str(running)
+        g.INSTALLED_SCRIPT = installed
+        g.APT_HOOK_FILE = hook_file
+        try:
+            check("no hook file installed: no warning",
+                  g.stale_hook_warning(), None)
+
+            fp = g.script_fingerprint(installed)
+            hook_file.write_text(f"// source: sha256:{fp}\nDPkg::Post-Invoke {{ }};\n")
+            check("fingerprint matches: no warning", g.stale_hook_warning(), None)
+
+            # The checkout moves on; the installed copy does not.
+            running.write_text("print('v2')\n")
+            check("fingerprint differs: warns",
+                  g.stale_hook_warning() is not None, True)
+
+            # Running the installed copy itself must never warn about itself.
+            g.__file__ = str(installed)
+            check("running the installed copy: no warning",
+                  g.stale_hook_warning(), None)
+        finally:
+            g.__file__, g.INSTALLED_SCRIPT, g.APT_HOOK_FILE = saved
 
 
 def test_jitstate_separates_llvm_packages_from_the_rest():

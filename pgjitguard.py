@@ -49,6 +49,8 @@ Options:
 """
 
 import argparse
+import functools
+import hashlib
 import os
 import platform
 import re
@@ -211,8 +213,16 @@ def resolve_deps(module: Path) -> dict[str, Optional[str]]:
     return resolved
 
 
+@functools.lru_cache(maxsize=None)
 def dpkg_owner(path: str) -> Optional[str]:
-    """Return the package owning a file, or None if dpkg does not track it."""
+    """Return the package owning a file, or None if dpkg does not track it.
+
+    Cached: this process runs once per invocation (including once per apt
+    transaction via the hook) and dpkg's file ownership does not change
+    mid-run, but 'dpkg -S' is slow and this gets called for the same paths
+    repeatedly -- once per soname in cmd_status, again for every sibling
+    installation's dependencies, again while building the pin manifest.
+    """
     if not shutil.which("dpkg"):
         return None
     real = str(Path(path).resolve())
@@ -226,13 +236,26 @@ def dpkg_owner(path: str) -> Optional[str]:
     return None
 
 
+class JitInspectionError(Exception):
+    """A PostgreSQL installation's JIT dependencies could not be determined.
+
+    Raised by JitState.__init__() when pg_config, readelf, or ldd fails or is
+    missing -- those raise SystemExit (see run() and require_tool(), used
+    throughout this module for straightforward top-level fatal errors), which
+    JitState converts to this narrower, specifically-named exception so a
+    caller inspecting one of several sibling installations (at_risk_
+    installations) can catch exactly "this installation was uninspectable"
+    without also catching an unrelated sys.exit() elsewhere in the same call
+    stack. The diagnostic has already been printed to stderr by the failing
+    call before this is raised.
+    """
+
+
 class JitState:
     """The resolved JIT dependency picture for one PostgreSQL installation."""
 
     def __init__(self, pg_config: Path):
         self.pg_config = pg_config
-        self.pg_version = get_pg_setting(pg_config, "--version")
-        self.module = find_llvmjit(pg_config)
         self.needed: list[str] = []
         self.resolved: dict[str, Optional[str]] = {}
         self.missing: list[str] = []
@@ -240,11 +263,18 @@ class JitState:
         self.llvm_packages: list[str] = []
         self.untracked: list[str] = []
 
-        if not self.module:
-            return
+        try:
+            self.pg_version = get_pg_setting(pg_config, "--version")
+            self.module = find_llvmjit(pg_config)
 
-        self.needed = direct_needed(self.module)
-        self.resolved = resolve_deps(self.module)
+            if not self.module:
+                return
+
+            self.needed = direct_needed(self.module)
+            self.resolved = resolve_deps(self.module)
+        except SystemExit as exc:
+            raise JitInspectionError(
+                f"could not inspect {pg_config}") from exc
 
         for soname in self.needed:
             path = self.resolved.get(soname)
@@ -302,8 +332,14 @@ class JitState:
 # --------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def installed_pin_version() -> Optional[str]:
-    """Return the installed dependency package's version, or None."""
+    """Return the installed dependency package's version, or None.
+
+    Cached for the same reason as dpkg_owner(): this is queried repeatedly
+    (cmd_status, protection_gaps, union_pin_packages across siblings) within
+    a single process lifetime, during which dpkg's state does not change.
+    """
     if not shutil.which("dpkg-query"):
         return None
     returncode, out, _ = run(
@@ -317,11 +353,13 @@ def installed_pin_version() -> Optional[str]:
     return version.strip() or None
 
 
+@functools.lru_cache(maxsize=None)
 def installed_pin_depends() -> list[str]:
     """Return the package names the installed pin currently depends on.
 
     Read from dpkg rather than from our own manifest: the manifest describes
     what we last wrote, while this describes what apt is actually enforcing.
+    Cached like installed_pin_version() -- called repeatedly per invocation.
     """
     if not shutil.which("dpkg-query"):
         return []
@@ -344,14 +382,30 @@ def next_pin_version() -> str:
 
     Upgrading in place rather than removing and reinstalling keeps the
     protection atomic: there is never a window in which the LLVM runtime sits
-    unprotected and an autoremove could take it.
+    unprotected and an autoremove could take it. dpkg would accept a lower
+    version with a warning rather than refuse it, so the version chosen here
+    genuinely has to sort higher -- a wrong guess is a silent downgrade.
     """
     current = installed_pin_version()
-    if current:
-        match = re.match(r"^1\.(\d+)$", current)
-        if match:
-            return f"1.{int(match.group(1)) + 1}"
-    return "1.1"
+    if not current:
+        return "1.1"
+    match = re.match(r"^(?:(\d+):)?1\.(\d+)$", current)
+    if match:
+        epoch, minor = match.groups()
+        prefix = f"{epoch}:" if epoch else ""
+        return f"{prefix}1.{int(minor) + 1}"
+    # `current` is outside the "[epoch:]1.N" scheme this tool has ever
+    # written -- manual tampering, or a future/older pgjitguard using a
+    # different one. Guessing "1.1" would be Debian-version-comparison-
+    # dependent on the exact contents of `current` and is not something to
+    # guess (see Debian Policy 5.6.12): an explicit epoch is documented to
+    # always outrank a version with a lower or absent one, regardless of
+    # what the rest looks like -- so bump whatever epoch is there, if any,
+    # rather than hardcoding "1:" and getting stuck unable to progress past
+    # it the next time this same fallback triggers.
+    epoch_match = re.match(r"^(\d+):", current)
+    next_epoch = int(epoch_match.group(1)) + 1 if epoch_match else 1
+    return f"{next_epoch}:1.1"
 
 
 def build_pin_package(state: JitState, version: str, workdir: Path,
@@ -513,9 +567,9 @@ def at_risk_installations(current: JitState) -> tuple[
             continue
         try:
             sibling = JitState(pg_config)
-        except SystemExit:
-            # JitState exits on an unreadable module; not fatal here, but not
-            # ignorable either.
+        except JitInspectionError:
+            # JitState raises on an unreadable module; not fatal here, but
+            # not ignorable either.
             uninspectable.append(pg_config)
             continue
         if sibling.has_jit and sibling.is_at_risk:
@@ -630,6 +684,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  apt hook:           "
           f"{'installed' if APT_HOOK_FILE.is_file() else 'not installed'}"
           f" ({APT_HOOK_FILE})")
+    stale = stale_hook_warning()
+    if stale:
+        print(f"    WARNING: {stale}")
 
     protected_by, gaps = protection_gaps(state)
 
@@ -887,8 +944,60 @@ APT_HOOK_TEMPLATE = """// Installed by pgjitguard.py -- do not edit.
 // The check warns but never fails, so it cannot wedge an apt run in progress.
 // --pg-config and --quiet are top-level options and must precede the
 // subcommand; argparse rejects them after it.
+//
+// source: sha256:{fingerprint}
+// A repo update does not reach {script} until install-hook is re-run; this
+// records what was actually copied, so "status" run from a checkout can
+// tell you when the installed hook has fallen behind.
 DPkg::Post-Invoke {{ "{script} --pg-config '{pg_config}' --quiet check --hook || true"; }};
 """
+
+FINGERPRINT_RE = re.compile(r"^// source: sha256:([0-9a-f]+)", re.MULTILINE)
+
+
+def script_fingerprint(path: Path) -> str:
+    """Short content hash identifying which revision of the script this is."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def stale_hook_warning() -> Optional[str]:
+    """Return a warning if the installed apt hook's script differs from the
+    one currently running, or None if they match or there is nothing to
+    compare against.
+
+    A repo update does not reach the installed copy under
+    /usr/local/sbin until install-hook is re-run, so the apt hook can keep
+    running old code indefinitely with nothing to say so. This is the only
+    place that notices -- and only when run from a checkout, since comparing
+    the installed copy to itself proves nothing.
+    """
+    if not APT_HOOK_FILE.is_file() or not INSTALLED_SCRIPT.is_file():
+        return None
+    match = FINGERPRINT_RE.search(APT_HOOK_FILE.read_text())
+    if not match:
+        return None
+    installed_fingerprint = match.group(1)
+
+    running = Path(__file__).resolve()
+    if running.samefile(INSTALLED_SCRIPT):
+        return None
+    if script_fingerprint(running) == installed_fingerprint:
+        return None
+    return (f"the installed apt hook's script (sha256:{installed_fingerprint}) "
+            f"does not match this one; if the checkout has moved on, re-run "
+            f"'install-hook' to update it")
+
+
+def has_unsafe_apt_conf_chars(path: Path) -> bool:
+    """True if embedding this path in the apt hook's double-quoted value
+    needs more care than this tool attempts.
+
+    apt.conf's own parser processes backslash escapes in a double-quoted
+    value before the shell ever sees it (see Configuration::Parse), so a
+    literal backslash is a second special character alongside the single and
+    double quotes already used to protect the path from shell word-splitting.
+    """
+    return any(c in str(path) for c in ("'", '"', "\\"))
 
 
 def cmd_install_hook(args: argparse.Namespace) -> int:
@@ -901,16 +1010,19 @@ def cmd_install_hook(args: argparse.Namespace) -> int:
     # would re-resolve at apt time against /usr/local/postgresql or root's PATH,
     # which need not be the installation the caller asked about.
     pg_config = find_pg_config(args.pg_config)
-    if "'" in str(pg_config) or '"' in str(pg_config):
-        print(f"Error: refusing to embed a quoted path in apt.conf: {pg_config}",
-              file=sys.stderr)
-        print("  Move the installation somewhere without quotes in its path.",
-              file=sys.stderr)
+    if has_unsafe_apt_conf_chars(pg_config):
+        print(f"Error: refusing to embed a quoted or backslashed path in "
+              f"apt.conf: {pg_config}", file=sys.stderr)
+        print("  Move the installation somewhere without those characters"
+              " in its path.", file=sys.stderr)
         return EXIT_ERROR
 
-    hook = APT_HOOK_TEMPLATE.format(script=INSTALLED_SCRIPT, pg_config=pg_config)
+    fingerprint = script_fingerprint(source)
+    hook = APT_HOOK_TEMPLATE.format(script=INSTALLED_SCRIPT, pg_config=pg_config,
+                                    fingerprint=fingerprint)
 
     print(f"Script:    {source}  ->  {INSTALLED_SCRIPT}")
+    print(f"Fingerprint: sha256:{fingerprint}")
     print(f"pg_config: {pg_config}")
     print(f"apt hook:  {APT_HOOK_FILE}")
     print()
@@ -1025,7 +1137,14 @@ def main() -> int:
         "install-hook": cmd_install_hook,
         "uninstall-hook": cmd_uninstall_hook,
     }
-    return handlers[args.command](args)
+    try:
+        return handlers[args.command](args)
+    except JitInspectionError:
+        # The diagnostic was already printed by whatever failed inside
+        # JitState (see JitInspectionError); this is only reached by a
+        # top-level command that constructs JitState directly rather than
+        # through at_risk_installations, which catches it itself.
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":
