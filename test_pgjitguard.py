@@ -88,6 +88,24 @@ def stub(**attrs):
     return lambda: [setattr(g, n, v) for n, v in saved.items()]
 
 
+def isolate_installations(**attrs):
+    """stub(), plus an empty INSTALL_BASE so no real installation is inspected.
+
+    protection_gaps() walks INSTALL_BASE for sibling installations, so a test
+    that describes only `current` otherwise inherits whatever PostgreSQL builds
+    exist on the machine running it -- and this file promises to run anywhere.
+    Returns a restore callable that also removes the temporary base.
+    """
+    base = tempfile.TemporaryDirectory()
+    restore = stub(INSTALL_BASE=Path(base.name), **attrs)
+
+    def undo():
+        restore()
+        base.cleanup()
+
+    return undo
+
+
 # ---------------------------------------------------------------------------
 # DT_NEEDED / ldd parsing
 # ---------------------------------------------------------------------------
@@ -137,8 +155,9 @@ def test_resolve_deps_on_healthy_module():
 # ---------------------------------------------------------------------------
 
 def test_pin_covering_current_packages_is_protected():
-    restore = stub(installed_pin_version=lambda: "1.2",
-                   installed_pin_depends=lambda: ["libllvm21", "libc6"])
+    restore = isolate_installations(
+        installed_pin_version=lambda: "1.2",
+        installed_pin_depends=lambda: ["libllvm21", "libc6"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
         check("protected by depends", by, ["dependency package"])
@@ -150,8 +169,9 @@ def test_pin_covering_current_packages_is_protected():
 def test_pin_left_behind_by_rebuild_is_a_gap():
     # The regression codex caught: a pin exists, so the old code reported
     # "protected" -- but it still guards libllvm20 after a rebuild onto 21.
-    restore = stub(installed_pin_version=lambda: "1.2",
-                   installed_pin_depends=lambda: ["libllvm20", "libc6"])
+    restore = isolate_installations(
+        installed_pin_version=lambda: "1.2",
+        installed_pin_depends=lambda: ["libllvm20", "libc6"])
     try:
         by, gaps = g.protection_gaps(FakeState(["libc6", "libllvm21"]))
         check("not counted as protected", by, [])
@@ -162,7 +182,7 @@ def test_pin_left_behind_by_rebuild_is_a_gap():
 
 
 def test_no_protection_at_all():
-    restore = stub(installed_pin_version=lambda: None)
+    restore = isolate_installations(installed_pin_version=lambda: None)
     try:
         by, gaps = g.protection_gaps(FakeState(["libllvm21"]))
         check("nothing protecting", (by, gaps), ([], []))
@@ -176,19 +196,78 @@ def test_private_llvm_needs_no_protection():
     not as an unprotected gap to nag about."""
     state = FakeState(["libc6", "libstdc++6"], llvm_packages=[])
     check("not at risk", state.is_at_risk, False)
-    restore = stub(installed_pin_version=lambda: None)
+    restore = isolate_installations(installed_pin_version=lambda: None)
     try:
         check("no gaps reported", g.protection_gaps(state), ([], []))
     finally:
         restore()
     # Even with a stale pin installed, there is nothing at risk to report.
-    restore = stub(installed_pin_version=lambda: "1.2",
-                   installed_pin_depends=lambda: ["libllvm20"])
+    restore = isolate_installations(
+        installed_pin_version=lambda: "1.2",
+        installed_pin_depends=lambda: ["libllvm20"])
     try:
         check("stale pin irrelevant when nothing is at risk",
               g.protection_gaps(state), ([], []))
     finally:
         restore()
+
+
+def test_protect_says_whose_dependency_it_is():
+    """The pin has one system-wide name, so it is routinely installed on behalf
+    of some *other* installation. Reported as a bare 'Protected.' right after
+    building a self-contained PostgreSQL, it reads as protecting the new build
+    -- which it does not, and does not need to."""
+    import contextlib as _ctx
+    import io as _io
+
+    state = FakeState(["libc6"], llvm_packages=[],
+                      pg_config="/usr/local/postgresql-18.6/bin/pg_config")
+    others = [
+        (Path("/usr/local/postgresql-12.20/bin/pg_config"), ["libllvm18"]),
+        (Path("/usr/local/postgresql-12.22/bin/pg_config"), ["libllvm18"]),
+    ]
+    restore = stub(next_pin_version=lambda: "1.2",
+                   installed_pin_version=lambda: None,
+                   require_root=lambda action: None,
+                   build_pin_package=lambda *a, **kw: Path("/tmp/pin.deb"),
+                   run=lambda cmd, check=True: (0, "", ""))
+    out = _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(out):
+            g.apply_depends(state, False, ["libc6", "libllvm18"], others, [])
+    finally:
+        restore()
+
+    printed = out.getvalue()
+    check("names the installations it is for",
+          "/usr/local/postgresql-12.20/bin/pg_config" in printed, True)
+    check("says the new build is not the reason",
+          "Not for /usr/local/postgresql-18.6/bin/pg_config" in printed, True)
+
+
+def test_protect_does_not_disown_the_build_it_covers():
+    """The same line must not appear when the build being protected IS one of
+    the contributors -- that would be equally misleading, in reverse."""
+    import contextlib as _ctx
+    import io as _io
+
+    state = FakeState(["libc6", "libllvm18"],
+                      pg_config="/usr/local/postgresql-18.6/bin/pg_config")
+    contributors = [(Path("/usr/local/postgresql-18.6/bin/pg_config"),
+                     ["libc6", "libllvm18"])]
+    restore = stub(next_pin_version=lambda: "1.2",
+                   installed_pin_version=lambda: None,
+                   require_root=lambda action: None,
+                   build_pin_package=lambda *a, **kw: Path("/tmp/pin.deb"),
+                   run=lambda cmd, check=True: (0, "", ""))
+    out = _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(out):
+            g.apply_depends(state, False, ["libc6", "libllvm18"], contributors, [])
+    finally:
+        restore()
+    check("no disclaimer when it is this build's dependency",
+          "Not for" in out.getvalue(), False)
 
 
 def test_system_llvm_is_still_at_risk():
@@ -272,7 +351,12 @@ def test_uninspectable_sibling_blocks_pin_removal():
         def explode(pg_config):
             raise g.JitInspectionError(f"could not inspect {pg_config}")
 
-        restore = stub(INSTALL_BASE=base, JitState=explode)
+        # union_pin_packages() carries an existing pin's dependencies forward
+        # for anything it could not inspect, so that pin has to be this test's,
+        # not whatever happens to be installed on the machine running it.
+        restore = stub(INSTALL_BASE=base, JitState=explode,
+                       installed_pin_version=lambda: None,
+                       installed_pin_depends=lambda: [])
         try:
             required, contributors, uninspectable = g.union_pin_packages(current)
             check("counted as uninspectable", uninspectable,

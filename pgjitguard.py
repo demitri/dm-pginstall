@@ -499,6 +499,23 @@ def apply_depends(state: JitState, dry_run: bool, packages: list[str],
         run(["dpkg", "-i", str(deb)])
 
     print(f"\nProtected. apt will refuse to remove: {', '.join(packages)}")
+
+    # Say whose dependency this is. The pin has one system-wide name, so it is
+    # routinely installed on behalf of an installation other than the one just
+    # built -- and reading "Protected" right after building a self-contained
+    # PostgreSQL suggests, wrongly, that this is what protects it.
+    if contributors:
+        print("  Needed by:")
+        for path, _ in contributors:
+            print(f"    {path}")
+        if not any(same_install(path, state.pg_config) for path, _ in contributors):
+            print(f"\n  Not for {state.pg_config}: that build carries its own LLVM")
+            print("  runtime, so nothing can take it away and no pin protects it.")
+    if uninspectable:
+        print("  Also carrying forward dependencies for:")
+        for path in uninspectable:
+            print(f"    {path}  (could not inspect)")
+
     if current:
         print("\nThe previous dependency set has been replaced. Any LLVM runtime it")
         print("protected that nothing else needs is now reclaimable:")
@@ -541,6 +558,14 @@ def remove_depends(dry_run: bool) -> int:
 # --------------------------------------------------------------------------
 
 
+def same_install(a: Path, b: Path) -> bool:
+    """Do these two pg_config paths refer to the same installation?"""
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
 def at_risk_installations(current: JitState) -> tuple[
         list[tuple[Path, list[str]]], list[Path]]:
     """Every PostgreSQL installation whose JIT needs a dpkg-owned LLVM.
@@ -563,7 +588,7 @@ def at_risk_installations(current: JitState) -> tuple[
         contributors.append((current.pg_config, current.packages))
 
     for pg_config in sorted(INSTALL_BASE.glob("postgresql-*/bin/pg_config")):
-        if pg_config.resolve() == current.pg_config.resolve():
+        if same_install(pg_config, current.pg_config):
             continue
         try:
             sibling = JitState(pg_config)
