@@ -2028,7 +2028,9 @@ def build_contrib_extensions(
 
     if not src_path.exists():
         print(f"  Error: PostgreSQL source not found at {src_path}", file=sys.stderr)
-        print("  Contrib extensions must be built from PostgreSQL source", file=sys.stderr)
+        print("  Contrib extensions must be built from PostgreSQL source, which is only", file=sys.stderr)
+        print(f"  extracted when PostgreSQL {pg_version} is built. Rebuild it to restore the", file=sys.stderr)
+        print("  source tree (answer yes to a rebuild prompt, or remove the install directory).", file=sys.stderr)
         sys.exit(1)
 
     env = get_extension_build_env()
