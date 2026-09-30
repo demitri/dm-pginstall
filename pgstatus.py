@@ -24,6 +24,12 @@ Options:
     --dry-run       Show what would be done (for start/stop/restart)
     -D, --pgdata    Additional data directory to scan (repeatable)
 """
+import sys
+if sys.version_info < (3, 10):
+    v = ".".join(map(str, sys.version_info[:3]))
+    print(f"Error: Python 3.10+ required (found {v}: {sys.executable})", file=sys.stderr)
+    print("  Hint: try running with an explicit path, e.g.: sudo /usr/local/anaconda/bin/python3 pgstatus.py", file=sys.stderr)
+    sys.exit(1)
 
 import argparse
 import json
@@ -38,6 +44,22 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+# ANSI color helpers (disabled when output is not a terminal)
+_USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def _red(text: str) -> str:
+    return f"\033[1;31m{text}\033[0m" if _USE_COLOR else text
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    """Return the visible length of a string, ignoring ANSI escape codes."""
+    return len(_ANSI_RE.sub("", text))
+
 
 # Constants - match the project conventions
 PG_BASE = Path("/usr/local/postgresql")
@@ -168,6 +190,9 @@ class PostgreSQLInstance:
     log_file: Optional[Path] = None
     pg_ctl_path: Optional[Path] = None
     stale_postmaster_pid: bool = False
+    limited_access: bool = False  # True when data directory couldn't be read
+    icu_status: Optional[str] = None  # None=not checked, "ok", "unavailable", "broken:<details>"
+    broken_extensions: Optional[list[str]] = None  # None=not checked, []=ok, ["q3c: ..."]
     notes: list[str] = field(default_factory=list)
     databases: Optional[list[DatabaseInfo]] = None
     databases_error: Optional[str] = None  # auth failure message, if any
@@ -584,8 +609,12 @@ def discover_process_instances(known_instances: list[PostgreSQLInstance]) -> lis
             continue
 
         data_path = Path(data_dir)
-        if not data_path.exists():
-            continue
+        permission_denied = False
+        try:
+            if not data_path.exists():
+                continue
+        except (OSError, PermissionError):
+            permission_denied = True
 
         # Generate instance name from data directory
         instance_name = data_path.name
@@ -601,11 +630,14 @@ def discover_process_instances(known_instances: list[PostgreSQLInstance]) -> lis
             service_type=ServiceType.PGCTL,
         )
 
-        instance.version = read_pg_version(data_path)
-        instance.config_file = data_path / "postgresql.conf"
+        if permission_denied:
+            instance.limited_access = True
+        else:
+            instance.version = read_pg_version(data_path)
+            instance.config_file = data_path / "postgresql.conf"
 
-        if instance.port is None:
-            instance.port = read_port_from_config(instance.config_file)
+            if instance.port is None:
+                instance.port = read_port_from_config(instance.config_file)
 
         instance.pg_ctl_path = find_pg_ctl()
 
@@ -645,6 +677,16 @@ def find_pg_ctl() -> Optional[Path]:
         Path("/usr/local/bin/pg_ctl"),
         Path("/opt/homebrew/bin/pg_ctl"),
     ]
+    # Also check alternate symlink name (postgres -> postgresql-X.Y)
+    alt_symlink = PG_BASE.parent / "postgres" / "bin" / "pg_ctl"
+    if alt_symlink != PG_BIN / "pg_ctl":
+        candidates.append(alt_symlink)
+    # Scan versioned installations (e.g. /usr/local/postgresql-17.5/bin/pg_ctl)
+    def _ver_key(path: Path) -> tuple:
+        return tuple(int(n) for n in re.findall(r"\d+", path.parents[1].name))
+    for path in sorted(PG_BASE.parent.glob("postgresql-*/bin/pg_ctl"),
+                       key=_ver_key, reverse=True):
+        candidates.append(path)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -802,6 +844,132 @@ def inspect_jit(pg_ctl_path: Optional[Path]) -> Optional[JitInfo]:
         break
 
     return info
+
+
+def _dependency_listing(binary_path: Path) -> Optional[str]:
+    """Raw ldd (Linux) or otool -L (macOS) output, or None if it could not run."""
+    cmd = ["otool", "-L", str(binary_path)] if get_platform() == "darwin" \
+        else ["ldd", str(binary_path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _find_missing_deps(binary_path: Path) -> Optional[list[str]]:
+    """Library names whose shared-object dependencies are not satisfied.
+
+    Returns None if the check itself fails, [] if all deps are satisfied.
+    """
+    output = _dependency_listing(binary_path)
+    if output is None:
+        return None
+    return [line.strip().split()[0] for line in output.splitlines()
+            if "not found" in line and line.strip()]
+
+
+def check_icu_status(pg_ctl_path: Optional[Path]) -> Optional[str]:
+    """
+    Check whether the postgres binary's ICU dependencies are satisfied.
+    ICU breakage prevents the server from starting at all.
+
+    Returns:
+        "ok"              – ICU deps present and satisfied
+        "unavailable"     – postgres not linked against ICU
+        "broken:<detail>" – ICU library missing
+        None              – could not determine
+    """
+    if not pg_ctl_path:
+        return None
+
+    postgres_bin = pg_ctl_path.parent / "postgres"
+    if not postgres_bin.exists():
+        return None
+
+    output = _dependency_listing(postgres_bin)
+    if output is None:
+        return None
+
+    icu_missing = [
+        line.strip().split()[0] for line in output.splitlines()
+        if "not found" in line and "icu" in line.lower() and line.strip()
+    ]
+    if icu_missing:
+        return f"broken:{', '.join(icu_missing)}"
+    return "ok" if "libicu" in output else "unavailable"
+
+
+# Extensions that ship with PostgreSQL source (contrib + core modules).
+# Third-party extensions not in this set get their deps checked.
+# Keep in sync with pginstall._CORE_PG_MODULES.
+_CORE_PG_LIBS = {
+    "btree_gin", "btree_gist", "cube", "dict_snowball", "earthdistance",
+    "fuzzystrmatch", "hstore", "intarray", "isn", "lo", "ltree",
+    "pageinspect", "passwordcheck", "pg_buffercache", "pgcrypto",
+    "pg_freespacemap", "pgoutput", "pg_prewarm", "pgrowlocks",
+    "pg_stat_statements", "pgstattuple", "pg_trgm", "pg_visibility",
+    "pg_walinspect", "plpgsql", "plpython3u", "pltcl", "plperl",
+    "postgres_fdw", "seg", "sslinfo", "tablefunc", "tcn",
+    "tsm_system_rows", "tsm_system_time", "unaccent", "uuid-ossp",
+    "xml2", "auto_explain", "auth_delay", "basebackup_to_shell",
+    "basic_archive", "bloom", "citext", "dblink", "file_fdw",
+    "amcheck", "old_snapshot", "pg_surgery",
+    # Core encoding conversion modules
+    "cyrillic_and_mic", "euc2004_sjis2004", "euc_cn_and_mic",
+    "euc_jp_and_sjis", "euc_kr_and_mic", "euc_tw_and_big5",
+    "latin2_and_win1250", "latin_and_mic",
+    "utf8_and_big5", "utf8_and_cyrillic", "utf8_and_euc2004",
+    "utf8_and_euc_cn", "utf8_and_euc_jp", "utf8_and_euc_kr",
+    "utf8_and_euc_tw", "utf8_and_gb18030", "utf8_and_gbk",
+    "utf8_and_iso8859", "utf8_and_iso8859_1", "utf8_and_johab",
+    "utf8_and_sjis", "utf8_and_sjis2004", "utf8_and_uhc",
+    "utf8_and_win",
+    # Names that differ from the extension name, plus remaining contrib
+    "plpython3", "pgxml", "_int", "dict_int", "dict_xsyn", "intagg",
+    "test_decoding", "hstore_plperl", "hstore_plpython3", "jsonb_plperl",
+    "jsonb_plpython3", "ltree_plpython3",
+    # Internal shared libs (not extensions)
+    "libpqwalreceiver", "llvmjit",
+}
+
+
+def check_extension_deps(pg_ctl_path: Optional[Path]) -> Optional[list[str]]:
+    """
+    Check third-party extension .so files for missing shared-library deps.
+
+    Returns:
+        []                 – all extensions OK (or no third-party extensions found)
+        ["q3c: libfoo..."] – list of broken extensions with details
+        None               – could not determine
+    """
+    if not pg_ctl_path:
+        return None
+
+    lib_dir = pg_ctl_path.parent.parent / "lib"
+    if not lib_dir.is_dir():
+        return None
+
+    plat = get_platform()
+    ext_suffix = ".dylib" if plat == "darwin" else ".so"
+    broken = []
+
+    for so_file in sorted(lib_dir.iterdir()):
+        if not so_file.name.endswith(ext_suffix):
+            continue
+        # Skip core PG libraries (libpq, libecpg, etc.)
+        if so_file.name.startswith("lib"):
+            continue
+        # Derive extension name from filename
+        ext_name = so_file.stem  # e.g. "q3c" from "q3c.so"
+        if ext_name in _CORE_PG_LIBS:
+            continue
+
+        missing = _find_missing_deps(so_file)
+        if missing:
+            broken.append(f"{ext_name}: {', '.join(missing)}")
+
+    return broken
 
 
 def get_latest_postgresql_version() -> Optional[str]:
@@ -1571,6 +1739,15 @@ def instance_issues(instance: PostgreSQLInstance) -> list[tuple[str, Optional[st
             f"pgstatus.py start {instance.name}",
         ))
 
+    if instance.icu_status and instance.icu_status.startswith("broken:"):
+        issues.append((
+            f"ICU broken: {instance.icu_status.split(':', 1)[1]} "
+            f"(server will not start)",
+            "pginstall.py --repair",
+        ))
+    for ext in instance.broken_extensions or []:
+        issues.append((f"extension broken: {ext}", "pginstall.py --repair"))
+
     jit = instance.jit
     if jit and jit.built:
         if jit.soname and not jit.resolved:
@@ -1782,6 +1959,26 @@ def discover_all_instances(
                 # data directory's PG_VERSION (otherwise it's a mismatch).
                 if inst.version is None or sv.startswith(inst.version.split(".")[0]):
                     inst.server_version = sv
+
+    # Check library health for each unique pg_ctl_path (JIT is enrich_jit's job)
+    icu_cache: dict[str, Optional[str]] = {}
+    ext_cache: dict[str, Optional[list[str]]] = {}
+    for inst in instances:
+        if inst.pg_ctl_path:
+            key = str(inst.pg_ctl_path)
+            if key not in icu_cache:
+                icu_cache[key] = check_icu_status(inst.pg_ctl_path)
+            inst.icu_status = icu_cache[key]
+            if inst.icu_status and inst.icu_status.startswith("broken:"):
+                missing = inst.icu_status.split(":", 1)[1]
+                inst.notes.append(f"ICU broken: {missing} (server will not start)")
+
+            if key not in ext_cache:
+                ext_cache[key] = check_extension_deps(inst.pg_ctl_path)
+            inst.broken_extensions = ext_cache[key]
+            if inst.broken_extensions:
+                for ext_detail in inst.broken_extensions:
+                    inst.notes.append(f"Extension broken: {ext_detail}")
 
     # Fetch latest available version if requested
     if check_latest:
@@ -1999,6 +2196,26 @@ def _format_databases_block(instance: PostgreSQLInstance, indent: str = "    ") 
     return lines
 
 
+def _format_lib_status(status: str) -> str:
+    """Format a library status string for display."""
+    if status.startswith("broken:"):
+        detail = status.split(":", 1)[1]
+        return _red(f"[!] broken ({detail})")
+    return status
+
+
+def _has_broken_deps(inst: 'PostgreSQLInstance') -> bool:
+    """Return True if the instance has any broken library dependencies."""
+    jit = inst.jit
+    if jit and jit.built and jit.soname and not jit.resolved:
+        return True
+    if inst.icu_status and inst.icu_status.startswith("broken:"):
+        return True
+    if inst.broken_extensions:
+        return True
+    return False
+
+
 def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     """Format instances as a table."""
     if not instances:
@@ -2031,8 +2248,9 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
             except ValueError:
                 pass
 
+        name_display = f"{_red('[!]')} {inst.name}" if _has_broken_deps(inst) else inst.name
         row = [
-            inst.name,
+            name_display,
             inst.status.value,
             str(inst.port) if inst.port else "-",
             version_str,
@@ -2050,11 +2268,11 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
                 row.append("-")
         rows.append(row)
 
-    # Calculate column widths
+    # Calculate column widths (using visible length to ignore ANSI codes)
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+            widths[i] = max(widths[i], _visible_len(cell))
 
     # Build output
     lines = []
@@ -2064,9 +2282,13 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
     lines.append(header_line)
     lines.append("  ".join("-" * w for w in widths))
 
-    # Rows
+    # Rows — pad using visible length so ANSI codes don't misalign columns
     for row in rows:
-        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+        parts = []
+        for i, cell in enumerate(row):
+            padding = widths[i] - _visible_len(cell)
+            parts.append(cell + " " * padding)
+        lines.append("  ".join(parts))
 
     # Auth hints footer for instances where database listing failed
     auth_failed = [i for i in instances if i.databases_error]
@@ -2076,14 +2298,19 @@ def format_list_table(instances: list[PostgreSQLInstance]) -> str:
             for err_line in inst.databases_error.splitlines():
                 lines.append(f"  {inst.name}: {err_line}")
 
-    # Notes footer for dormant instances
-    dormant_with_notes = [i for i in instances if i.status == InstanceStatus.DORMANT and i.notes]
-    if dormant_with_notes:
+    # Notes footer
+    instances_with_notes = [i for i in instances if i.notes]
+    if instances_with_notes:
         lines.append("")
         lines.append("Notes:")
-        for inst in dormant_with_notes:
+        for inst in instances_with_notes:
             for note in inst.notes:
                 lines.append(f"  {inst.name}: {note}")
+
+    # Hint to use sudo when some data directories were not accessible
+    if any(i.limited_access for i in instances):
+        lines.append("")
+        lines.append("Run with sudo for complete details (ports, config).")
 
     return "\n".join(lines)
 
@@ -2147,6 +2374,13 @@ def format_list_json(instances: list[PostgreSQLInstance]) -> str:
     return json.dumps([i.to_dict() for i in instances], indent=2)
 
 
+def _display_notes(instance: PostgreSQLInstance) -> list[str]:
+    """Notes for the detail views. ICU and extension breakage already has its
+    own line there, so repeating it as a note would say it twice."""
+    return [n for n in instance.notes
+            if not n.startswith(("ICU broken:", "Extension broken:"))]
+
+
 def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
     """Format instances with expanded details."""
     if not instances:
@@ -2191,6 +2425,12 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             except ValueError:
                 pass
         lines.append(f"    Service:     {inst.service_type.value}")
+        if inst.icu_status:
+            lines.append(f"    ICU:         {_format_lib_status(inst.icu_status)}")
+        if inst.broken_extensions:
+            for ext_detail in inst.broken_extensions:
+                name, _, detail = ext_detail.partition(": ")
+                lines.append(f"    Extension:   {name} broken ({detail})")
 
         # Paths
         lines.append(f"    Data Dir:    {inst.data_directory or '-'}")
@@ -2228,10 +2468,11 @@ def format_list_expanded(instances: list[PostgreSQLInstance]) -> str:
             lines.extend(_format_databases_block(inst, indent="    "))
 
         # Notes
-        if inst.notes:
+        notes = _display_notes(inst)
+        if notes:
             lines.append("")
             lines.append("    Notes:")
-            for note in inst.notes:
+            for note in notes:
                 lines.append(f"      - {note}")
 
     return "\n".join(lines)
@@ -2267,6 +2508,12 @@ def format_info(instance: PostgreSQLInstance) -> str:
         except ValueError:
             pass
     lines.append(f"  Data Dir:    {instance.data_directory or '-'}")
+    if instance.icu_status:
+        lines.append(f"  ICU:         {_format_lib_status(instance.icu_status)}")
+    if instance.broken_extensions:
+        for ext_detail in instance.broken_extensions:
+            name, _, detail = ext_detail.partition(": ")
+            lines.append(f"  Extension:   {name} broken ({detail})")
     lines.append("")
 
     # Service section
@@ -2332,10 +2579,12 @@ def format_info(instance: PostgreSQLInstance) -> str:
         lines.extend(_format_databases_block(instance, indent="  "))
 
     # Notes section
-    if instance.notes:
+    # ICU and extension breakage already has its own line above.
+    notes = _display_notes(instance)
+    if notes:
         lines.append("")
         lines.append("Notes:")
-        for note in instance.notes:
+        for note in notes:
             lines.append(f"  - {note}")
 
     return "\n".join(lines)

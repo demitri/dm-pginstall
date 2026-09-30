@@ -1126,6 +1126,99 @@ def test_extensions_install_into_the_version_built_not_the_symlink():
              p.download_and_extract, p.get_extension_build_env) = saved
 
 
+def test_dependency_versions_sort_numerically():
+    names = ["icu-9", "icu-76", "icu-77.1", "icu-77_1"]
+    ordered = sorted(names, key=lambda n: p._version_key(n[4:]), reverse=True)
+    check("newest first, 9 is not above 76", ordered[-1], "icu-9")
+    check("release beats its pre-release",
+          p._version_key("3.0.0") > p._version_key("3.0.0-beta1"), True)
+    check("no digits sorts last", p._version_key("abc") < p._version_key("1"), True)
+
+
+def test_dependency_path_prefers_the_newest_versioned_directory():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for name in ("icu-9.1", "icu-76.1"):
+            (base / name / "include").mkdir(parents=True)
+        saved = p.INSTALL_BASE
+        p.INSTALL_BASE = base
+        try:
+            check("numeric, not textual", p._resolve_dep_path(["icu"]).name, "icu-76.1")
+            (base / "icu").symlink_to(base / "icu-9.1")
+            check("a symlink resolves to its versioned target",
+                  p._resolve_dep_path(["icu"]).name, "icu-9.1")
+        finally:
+            p.INSTALL_BASE = saved
+
+
+def _run_repair(broken, old_flags, with_llvm=False, dry_run=False):
+    """Drive _repair_one_installation with everything external stubbed out."""
+    calls = []
+    names = ("check_broken_deps", "get_pg_configure_flags", "prompt_yes_no",
+             "build_postgresql", "build_contrib_extensions", "build_q3c",
+             "offer_jit_protection", "load_versions",
+             "find_existing_private_llvm_config")
+    saved = {n: getattr(p, n) for n in names}
+    seq = iter([broken, []])
+    p.check_broken_deps = lambda target: next(seq, [])
+    p.get_pg_configure_flags = lambda target: old_flags
+    p.prompt_yes_no = lambda *a, **k: True
+    p.build_postgresql = lambda *a, **k: calls.append(("pg", a, k)) or True
+    p.build_contrib_extensions = lambda *a, **k: calls.append(("contrib", a, k))
+    p.build_q3c = lambda *a, **k: calls.append(("q3c", a, k))
+    p.offer_jit_protection = lambda *a, **k: calls.append(("jit", a, k))
+    p.load_versions = lambda *_: {"q3c": "2.0.1"}
+    p.find_existing_private_llvm_config = lambda: None
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            result = p._repair_one_installation(
+                Path("/nonexistent/postgresql-17.5"), "17.5",
+                dry_run, False, with_llvm)
+    finally:
+        for n, v in saved.items():
+            setattr(p, n, v)
+    return result, calls, out.getvalue()
+
+
+def test_repair_of_a_core_break_keeps_the_builds_llvm_flags():
+    # The recorded LLVM_CONFIG does not exist on disk here, so it is replaced
+    # by discovery -- but JIT must not be dropped.
+    flags = configure_line("--with-llvm", "LLVM_CONFIG=/nonexistent/llvm-config")
+    result, calls, _ = _run_repair([("postgres", ["libicuuc.so.76"])], flags)
+    pg = [c for c in calls if c[0] == "pg"]
+    check("rebuilt", result, True)
+    check("LLVM support survives a rebuild", pg[0][2]["with_llvm"], True)
+    check("rebuild is forced", pg[0][2]["force_rebuild"], True)
+    check("the symlink is left alone", pg[0][2]["no_alias"], True)
+
+
+def test_repair_dry_run_reports_the_llvm_it_would_use():
+    flags = configure_line("--with-llvm")
+    _, calls, out = _run_repair([("postgres", ["libicuuc.so.76"])], flags,
+                                dry_run=True)
+    check("nothing is built in a dry run", calls, [])
+    check("the preview names LLVM", "--with-llvm" in out, True)
+
+
+def test_repair_routes_third_party_extensions_to_their_builder():
+    _, calls, _ = _run_repair([("q3c", ["libfoo.so"])], "")
+    check("only q3c is rebuilt", [c[0] for c in calls], ["q3c"])
+    check("into the broken installation's version", calls[0][1][:2], ("2.0.1", "17.5"))
+
+
+def test_repair_does_not_force_a_rebuild_that_cannot_help():
+    result, calls, out = _run_repair([("plpython3", ["libpython3.so"])], "")
+    check("nothing rebuilt", (result, calls), (False, []))
+    check("says why", "rebuild manually" in out, True)
+
+
+def test_repair_rebuilds_for_modules_pginstall_builds():
+    _, calls, _ = _run_repair([("pg_trgm", ["libx.so"])], "")
+    check("a contrib module means a PostgreSQL rebuild",
+          [c[0] for c in calls if c[0] == "pg"], ["pg"])
+
+
 # ---------------------------------------------------------------------------
 
 def main():

@@ -13,10 +13,17 @@ Options:
     --dry-run          Show what would be done without executing
     --component NAME   Build only specific component
     --skip-extensions  Skip q3c and pgast
+    --repair           Rebuild installations whose shared-library deps are broken
     --with-llvm        Enable LLVM/JIT support (required on macOS, auto on Linux)
     --build-llvm       Build LLVM from source rather than using the system one
     --verbose          Show all build output
 """
+import sys
+if sys.version_info < (3, 10):
+    v = ".".join(map(str, sys.version_info[:3]))
+    print(f"Error: Python 3.10+ required (found {v}: {sys.executable})", file=sys.stderr)
+    print("  Hint: try running with an explicit path, e.g.: sudo /usr/local/anaconda/bin/python3 pginstall.py", file=sys.stderr)
+    sys.exit(1)
 
 import argparse
 import configparser
@@ -583,6 +590,140 @@ def check_pg_needs_rebuild(install_path: Path,
         return None
     missing = [flag for flag in required_flags if flag not in configure_str]
     return missing
+
+
+def _version_key(text: str) -> tuple:
+    """Sort key comparing dotted versions numerically (icu-9 < icu-76).
+
+    A trailing pre-release tag (3.0.0-beta1) sorts below its release.
+    """
+    m = re.match(r"\d+(?:[._]\d+)*", text)
+    if not m:
+        return ((), 1)
+    numbers = tuple(int(n) for n in re.findall(r"\d+", m.group()))
+    is_prerelease = bool(text[m.end():])
+    return (numbers, 0 if is_prerelease else 1)
+
+
+def _resolve_dep_path(symlink_names: list[str]) -> Path:
+    """Resolve the install path for a dependency (ICU, OpenSSL, etc.).
+
+    Checks symlinks first, then scans for versioned directories.
+    Falls back to INSTALL_BASE / symlink_names[0] so configure gives a clear error.
+    """
+    # Check symlinks (e.g. /usr/local/icu, /usr/local/icu4c)
+    for sname in symlink_names:
+        candidate = INSTALL_BASE / sname
+        if candidate.exists():
+            return candidate.resolve() if candidate.is_symlink() else candidate
+
+    # Scan versioned directories (e.g. /usr/local/openssl-3.6.1, /usr/local/icu4c-77.1)
+    # Try each symlink name as a prefix, pick the newest
+    for sname in symlink_names:
+        matches = sorted(INSTALL_BASE.glob(f"{sname}-*"),
+                         key=lambda m: _version_key(m.name[len(sname) + 1:]),
+                         reverse=True)
+        for m in matches:
+            if m.is_dir() and not m.is_symlink() and (m / "include").is_dir():
+                return m
+
+    # Fallback — let configure produce a clear error
+    return INSTALL_BASE / symlink_names[0]
+
+
+def _find_missing_deps(binary_path: Path) -> Optional[list[str]]:
+    """Run ldd (Linux) or otool -L (macOS) on a binary and return missing deps.
+
+    Returns None if the check itself fails, [] if all deps are satisfied.
+    """
+    plat = get_platform()
+    try:
+        if plat == "darwin":
+            result = subprocess.run(
+                ["otool", "-L", str(binary_path)],
+                capture_output=True, text=True, timeout=5,
+            )
+        else:
+            result = subprocess.run(
+                ["ldd", str(binary_path)],
+                capture_output=True, text=True, timeout=5,
+            )
+        if result.returncode != 0:
+            return None
+        missing = []
+        for line in result.stdout.splitlines():
+            if "not found" in line:
+                lib_name = line.strip().split()[0] if line.strip() else "unknown"
+                missing.append(lib_name)
+        return missing
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        return None
+
+
+# Modules that ship with PostgreSQL itself (core, contrib, PLs, encoding
+# conversions). A break in one is fixed by rebuilding PostgreSQL, not by
+# rebuilding a third-party extension. Keep in sync with pgstatus._CORE_PG_LIBS.
+_CORE_PG_MODULES = {
+    "btree_gin", "btree_gist", "cube", "dict_snowball", "earthdistance",
+    "fuzzystrmatch", "hstore", "intarray", "_int", "isn", "lo", "ltree",
+    "pageinspect", "passwordcheck", "pg_buffercache", "pgcrypto",
+    "pg_freespacemap", "pgoutput", "pg_prewarm", "pgrowlocks",
+    "pg_stat_statements", "pgstattuple", "pg_trgm", "pg_visibility",
+    "pg_walinspect", "plpgsql", "plpython3", "plpython3u", "pltcl", "plperl",
+    "postgres_fdw", "seg", "sslinfo", "tablefunc", "tcn",
+    "tsm_system_rows", "tsm_system_time", "unaccent", "uuid-ossp",
+    "xml2", "pgxml", "auto_explain", "auth_delay", "basebackup_to_shell",
+    "basic_archive", "bloom", "citext", "dblink", "file_fdw",
+    "amcheck", "old_snapshot", "pg_surgery", "dict_int", "dict_xsyn",
+    "intagg", "test_decoding", "libpqwalreceiver", "llvmjit",
+    "hstore_plperl", "hstore_plpython3", "jsonb_plperl", "jsonb_plpython3",
+    "ltree_plpython3",
+}
+
+
+def _is_rebuilt_with_postgresql(component: str) -> bool:
+    """True if a PostgreSQL build by pginstall (re)produces this module."""
+    return (component in CONTRIB_EXTENSIONS
+            or component in {"plpgsql", "dict_snowball", "pgoutput",
+                             "libpqwalreceiver"}
+            or "_and_" in component)            # encoding conversion modules
+
+
+def check_broken_deps(install_path: Path) -> list[tuple[str, list[str]]]:
+    """Check a PostgreSQL installation for broken shared library dependencies.
+
+    Checks the postgres binary, llvmjit.so, and any third-party extension .so files.
+
+    Returns a list of (component, [missing_libs]) tuples for broken components.
+    """
+    broken = []
+    bin_dir = install_path / "bin"
+    lib_dir = install_path / "lib"
+
+    # Check the main postgres binary (ICU, OpenSSL, etc.)
+    postgres_bin = bin_dir / "postgres"
+    if postgres_bin.exists():
+        missing = _find_missing_deps(postgres_bin)
+        if missing:
+            broken.append(("postgres", missing))
+
+    if not lib_dir.is_dir():
+        return broken
+
+    # Check all .so files in lib/
+    plat = get_platform()
+    ext_suffix = ".dylib" if plat == "darwin" else ".so"
+    for so_file in sorted(lib_dir.iterdir()):
+        if not so_file.name.endswith(ext_suffix):
+            continue
+        # Skip libpq, libecpg, etc. — they're PG's own shared libs
+        if so_file.name.startswith("lib"):
+            continue
+        missing = _find_missing_deps(so_file)
+        if missing:
+            broken.append((so_file.stem, missing))
+
+    return broken
 
 
 def find_existing_postgresql_installations() -> list[tuple[str, Path]]:
@@ -1669,9 +1810,12 @@ def embed_llvm_runtime(pkglibdir: Path, llvm_libdir: Path, verbose: bool) -> boo
 def build_postgresql(
     version: str, dry_run: bool = False, verbose: bool = False,
     with_llvm: bool = False, no_alias: bool = False,
-    llvm_config: Optional[str] = None,
+    llvm_config: Optional[str] = None, force_rebuild: bool = False,
 ) -> bool:
     """Build PostgreSQL from source.
+
+    force_rebuild skips the "already installed" short-circuit; --repair needs
+    it because a broken dependency leaves the configure flags unchanged.
 
     Returns whether this installation's LLVM runtime ended up self-contained,
     which decides what the JIT protection step afterwards has to say.
@@ -1708,7 +1852,9 @@ def build_postgresql(
                 print(f"\n  The symlink '{symlink_path}' currently points to version {current_version}.")
                 print(f"  This script will NOT delete existing installations.")
 
-                if not dry_run:
+                if no_alias:
+                    print(f"  Will install {version} but leave symlink pointing to {current_version}")
+                elif not dry_run:
                     update_symlink = prompt_yes_no(
                         f"\n  Update symlink to point to new version {version}?",
                         default=True
@@ -1769,7 +1915,10 @@ def build_postgresql(
             return False
         return embed_llvm_runtime(pkglibdir, libdir, verbose)
 
-    if check_existing(install_path):
+    if force_rebuild and check_existing(install_path):
+        print(f"  Forcing rebuild of {install_path}")
+        needs_rebuild = True
+    elif check_existing(install_path):
         missing_flags = check_pg_needs_rebuild(install_path, required_configure_flags)
         if missing_flags is None:
             print(f"  Already installed: {install_path}")
@@ -1827,7 +1976,7 @@ def build_postgresql(
 
     # Build configure command
     plat = get_platform()
-    icu_path = INSTALL_BASE / "icu"
+    icu_path = _resolve_dep_path(["icu", "icu4c"])
 
     configure_cmd = [
         "./configure",
@@ -1844,7 +1993,7 @@ def build_postgresql(
     # Platform-specific options
     if plat == "darwin":
         # macOS: OpenSSL and readline are custom source builds under /usr/local
-        openssl_path = INSTALL_BASE / "openssl"
+        openssl_path = _resolve_dep_path(["openssl"])
 
         # Determine OpenSSL lib directory (3.x uses lib64 on some platforms)
         openssl_lib_dir = openssl_path / "lib64"
@@ -1939,7 +2088,8 @@ def build_postgresql(
 
     if not dry_run:
         # Clean stale objects when rebuilding with different configure flags
-        if needs_rebuild:
+        if needs_rebuild and (src_path / "GNUmakefile").exists():
+            # Top-level 'make clean' fails on a tree that was never configured.
             run_build_cmd(
                 ["make", "clean"],
                 cwd=src_path,
@@ -2287,7 +2437,7 @@ _{script_name.replace("-", "_").replace(".", "_")}_completions() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --build-llvm --no-alias --verbose --completions --help"
+    opts="--config --dry-run --component --skip-extensions --exclude-ast --with-llvm --build-llvm --no-alias --repair --verbose --completions --help"
     components="readline openssl icu llvm postgresql contrib q3c ast pgast"
 
     case "${{prev}}" in
@@ -2334,6 +2484,7 @@ _pginstall() {{
         '--with-llvm[Enable LLVM/JIT support (opt-in on macOS, auto on Linux)]'
         '--build-llvm[Build LLVM from source instead of using the system LLVM]'
         '--no-alias[Skip creating/updating symlinks in /usr/local]'
+        '--repair[Rebuild installations with broken shared-library dependencies]'
         '--verbose[Show all build output]'
         '--completions[Output shell completion script]:shell:(bash zsh)'
         '--help[Show help message]'
@@ -2359,6 +2510,8 @@ Examples:
   %(prog)s --skip-extensions   # Skip q3c, ast, and pgast
   %(prog)s --exclude-ast       # Skip Starlink AST library and pgast
   %(prog)s --with-llvm         # Enable LLVM/JIT support (required on macOS)
+  %(prog)s --repair            # Check and fix broken shared library deps
+  %(prog)s --repair --dry-run  # Show what repair would do
 
 Components:
   readline     GNU readline (macOS only)
@@ -2427,6 +2580,11 @@ Shell completions:
         "--verbose",
         action="store_true",
         help="Show all build output",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Check and rebuild PostgreSQL if shared library dependencies are broken",
     )
     parser.add_argument(
         "--completions",
@@ -2743,6 +2901,201 @@ def check_prerequisites(dry_run: bool = False, exclude_ast: bool = False,
     return missing
 
 
+def _repair_one_installation(
+    target: Path, version: str,
+    dry_run: bool, verbose: bool, with_llvm: bool,
+) -> bool:
+    """Check and repair a single PostgreSQL installation. Returns True if repairs were made."""
+    broken = check_broken_deps(target)
+    if not broken:
+        print(f"  All dependencies OK.")
+        return False
+
+    # The scan in repair_installation() has already listed what is broken.
+    needs_pg_rebuild = False
+    needs_ext_rebuild = []
+    unrebuildable = []
+
+    for component, missing_libs in broken:
+        if component == "postgres":
+            needs_pg_rebuild = True
+        elif component == "llvmjit":
+            needs_pg_rebuild = True
+            with_llvm = True
+        elif _is_rebuilt_with_postgresql(component):
+            needs_pg_rebuild = True
+        elif component in _CORE_PG_MODULES or "_and_" in component:
+            # Shipped with PostgreSQL but only built when configure asks for it
+            # (--with-python, --with-libxml, ...), which pginstall never does.
+            # A forced rebuild would not touch it.
+            unrebuildable.append(component)
+        else:
+            needs_ext_rebuild.append(component)
+
+    def rebuild_extensions_and_verify() -> None:
+        versions = load_versions(None)
+        for ext_name in needs_ext_rebuild:
+            if ext_name == "q3c" and "q3c" in versions:
+                build_q3c(versions["q3c"], version, dry_run=False, verbose=verbose)
+            else:
+                print(f"  WARNING: Don't know how to rebuild extension '{ext_name}'.")
+
+        print(f"\n  Verifying...")
+        still_broken = check_broken_deps(target)
+        if still_broken:
+            print(f"  WARNING: Some dependencies are still broken:")
+            for component, missing_libs in still_broken:
+                for lib in missing_libs:
+                    print(f"    {component}: {lib}")
+        else:
+            print(f"  Repair successful.")
+
+    if unrebuildable:
+        print(f"  Cannot repair by rebuilding: {', '.join(unrebuildable)}")
+        print(f"  These need a PostgreSQL configured outside pginstall "
+              f"(--with-python, --with-libxml, ...); rebuild manually.")
+
+    if needs_pg_rebuild:
+        # A rebuild must not silently drop JIT: honour what the existing build
+        # was configured with, not just the command line. Resolved before the
+        # dry-run branch so the preview says what the real run will do.
+        old_flags = get_pg_configure_flags(target)
+        if old_flags is None:
+            print(f"  WARNING: cannot read the existing configure flags; "
+                  f"LLVM support is taken from --with-llvm only.")
+            old_flags = ""
+        if "--with-llvm" in old_flags:
+            with_llvm = True
+        llvm_config = None
+        if with_llvm:
+            # Prefer a private LLVM so a repair doesn't quietly fall back to
+            # the system one (the dependency --build-llvm exists to avoid).
+            recorded = re.search(r"LLVM_CONFIG='?([^'\s]+)", old_flags)
+            llvmjit_broken = any(c == "llvmjit" for c, _ in broken)
+            if recorded and not llvmjit_broken and Path(recorded.group(1)).exists():
+                llvm_config = recorded.group(1)
+            else:
+                llvm_config = find_existing_private_llvm_config()
+        llvm_desc = (f"--with-llvm, LLVM_CONFIG={llvm_config or 'auto-detected'}"
+                     if with_llvm else "no LLVM")
+
+        if dry_run:
+            print(f"  Would rebuild PostgreSQL {version} ({llvm_desc})")
+            print(f"  Would rebuild contrib extensions")
+            if needs_ext_rebuild:
+                print(f"  Would rebuild extensions: {', '.join(needs_ext_rebuild)}")
+        else:
+            proceed = prompt_yes_no(
+                f"  Rebuild PostgreSQL {version} to fix broken dependencies?",
+                default=True,
+            )
+            if not proceed:
+                print(f"  Skipping {version}.")
+                return False
+
+            self_contained = build_postgresql(
+                version, dry_run=False, verbose=verbose,
+                with_llvm=with_llvm, no_alias=True,
+                llvm_config=llvm_config, force_rebuild=True)
+            build_contrib_extensions(version, dry_run=False, verbose=verbose)
+            rebuild_extensions_and_verify()
+
+            if with_llvm:
+                offer_jit_protection(False, target / "bin" / "pg_config",
+                                     self_contained=self_contained)
+    elif needs_ext_rebuild:
+        if dry_run:
+            print(f"  Would rebuild extensions: {', '.join(needs_ext_rebuild)}")
+        else:
+            proceed = prompt_yes_no(
+                f"  Rebuild broken extensions ({', '.join(needs_ext_rebuild)})?",
+                default=True,
+            )
+            if not proceed:
+                print(f"  Skipping {version}.")
+                return False
+            rebuild_extensions_and_verify()
+    else:
+        return False        # nothing pginstall can rebuild
+
+    return True
+
+
+def repair_installation(
+    dry_run: bool = False, verbose: bool = False, with_llvm: bool = False,
+) -> None:
+    """Check all PostgreSQL installations for broken deps and rebuild if needed."""
+    print("PostgreSQL Repair")
+    print("=" * 60)
+
+    installations = find_existing_postgresql_installations()
+    if not installations:
+        print("No PostgreSQL installations found.")
+        sys.exit(1)
+
+    # Scan all installations for broken deps
+    print("\nScanning installations...")
+    broken_installs = []
+    for version, target in installations:
+        broken = check_broken_deps(target)
+        if broken:
+            broken_installs.append((version, target, broken))
+            print(f"  {version} ({target}): broken")
+            for component, missing_libs in broken:
+                for lib in missing_libs:
+                    print(f"      {component}: {lib} not found")
+        else:
+            print(f"  {version} ({target}): ok")
+
+    if not broken_installs:
+        print("\nAll installations OK. Nothing to repair.")
+        return
+
+    # Determine which to repair
+    if len(broken_installs) == 1:
+        # Only one broken — repair it directly
+        version, target, _ = broken_installs[0]
+        print(f"\nRepairing {version}...")
+        _repair_one_installation(target, version, dry_run, verbose, with_llvm)
+    else:
+        # Multiple broken — let the user choose
+        print(f"\nMultiple installations need repair:")
+        for i, (version, target, _) in enumerate(broken_installs, 1):
+            print(f"  {i}) {version} ({target})")
+
+        while broken_installs:
+            if len(broken_installs) == 1:
+                choice = 1
+            else:
+                try:
+                    raw = input(f"\nRepair which installation? [1-{len(broken_installs)}, q to quit]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nAborted.")
+                    return
+                if raw.lower() in ("q", "quit", ""):
+                    return
+                try:
+                    choice = int(raw)
+                except ValueError:
+                    print(f"  Invalid choice.")
+                    continue
+                if choice < 1 or choice > len(broken_installs):
+                    print(f"  Invalid choice.")
+                    continue
+
+            version, target, _ = broken_installs[choice - 1]
+            print(f"\nRepairing {version}...")
+            _repair_one_installation(target, version, dry_run, verbose, with_llvm)
+            broken_installs.pop(choice - 1)
+
+            if broken_installs:
+                print(f"\nRemaining:")
+                for i, (v, t, _) in enumerate(broken_installs, 1):
+                    print(f"  {i}) {v} ({t})")
+            else:
+                print("\nAll repairs complete.")
+
+
 def main() -> None:
     """Main entry point."""
     args = parse_args()
@@ -2761,6 +3114,12 @@ def main() -> None:
     if args.component == "llvm" and not args.build_llvm:
         print("--component llvm requires --build-llvm", file=sys.stderr)
         sys.exit(1)
+
+    # Handle --repair mode
+    if args.repair:
+        repair_installation(dry_run=args.dry_run, verbose=args.verbose,
+                            with_llvm=args.with_llvm or args.build_llvm)
+        sys.exit(0)
 
     plat = get_platform()
 

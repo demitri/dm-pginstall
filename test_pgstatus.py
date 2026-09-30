@@ -438,6 +438,51 @@ def test_check_stays_quiet_about_an_idle_build_that_merely_links_system_llvm():
         check("counted", count, 1)
 
 
+def test_list_table_aligns_when_a_name_is_coloured():
+    """Colour codes are invisible but count towards len(); padding has to
+    measure what is shown or the columns drift on a broken instance."""
+    saved = g._USE_COLOR
+    g._USE_COLOR = True
+    try:
+        ok = g.PostgreSQLInstance(name="alpha", port=5432)
+        bad = g.PostgreSQLInstance(name="beta", port=5433)
+        bad.icu_status = "broken:libicuuc.so.77"
+        table = g.format_list_table([ok, bad])
+    finally:
+        g._USE_COLOR = saved
+    rows = [g._ANSI_RE.sub("", line) for line in table.splitlines()]
+    check("the broken instance is marked", any("[!] beta" in r for r in rows), True)
+    header = next(r for r in rows if r.startswith("Instance"))
+    col = header.index("Status")
+    data = [r for r in rows if "alpha" in r or "beta" in r]
+    check("columns line up",
+          [r[col:].split()[0] for r in data], ["unknown", "unknown"])
+    check("visible length ignores colour", g._visible_len("\033[1;31mab\033[0m"), 2)
+
+
+def test_icu_and_extension_breakage_is_not_repeated_as_a_note():
+    inst = g.PostgreSQLInstance(name="a")
+    inst.notes = ["ICU broken: libicuuc.so.77 (server will not start)",
+                  "Extension broken: q3c: libfoo.so", "Previously started as: x"]
+    check("only the unrelated note remains", g._display_notes(inst),
+          ["Previously started as: x"])
+
+
+def test_icu_status_reads_one_listing():
+    calls = []
+    saved = g._dependency_listing
+    g._dependency_listing = lambda path: calls.append(path) or (
+        "\tlibicuuc.so.77 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "postgres").write_text("")
+        try:
+            status = g.check_icu_status(Path(tmp) / "pg_ctl")
+        finally:
+            g._dependency_listing = saved
+    check("missing ICU is reported", status, "broken:libicuuc.so.77")
+    check("the binary is inspected once", len(calls), 1)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:
