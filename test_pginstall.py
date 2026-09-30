@@ -1030,6 +1030,102 @@ def test_compression_packages_use_real_package_names():
     check("pacman: zstd", "zstd" in pacman, True)
 
 
+def test_pkg_config_required_on_every_platform():
+    """configure resolves lz4/zstd through pkg-config on Linux, so a missing
+    pkg-config must be caught by the prerequisite check, not by configure."""
+    saved = p.get_platform
+    try:
+        for plat in ("linux", "darwin"):
+            p.get_platform = lambda plat=plat: plat
+            tools = p.get_required_tools(exclude_ast=True)
+            check(f"{plat}: pkg-config required", "pkg-config" in tools, True)
+    finally:
+        p.get_platform = saved
+
+
+def test_pkg_config_has_real_package_names():
+    expected = {"apt": "pkg-config", "dnf": "pkgconf-pkg-config",
+                "yum": "pkgconf-pkg-config", "pacman": "pkgconf"}
+    for mgr, name in expected.items():
+        got = p.get_package_names_for_tools(["pkg-config"], mgr)
+        check(f"{mgr}: pkg-config -> {name}", got, [name])
+
+
+def test_missing_contrib_extension_is_an_error():
+    """A contrib extension absent from the source tree must stop the run, not
+    warn and carry on to report success."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp)
+        contrib = src / "postgresql-18.6" / "contrib"
+        contrib.mkdir(parents=True)
+        for ext in p.CONTRIB_EXTENSIONS[1:]:  # all but the first are present
+            (contrib / ext).mkdir()
+
+        pg_bin = src / "install" / "postgresql-18.6" / "bin"
+        pg_bin.mkdir(parents=True)
+        (pg_bin / "pg_config").write_text("")
+
+        saved = (p.SRC_DIR, p.run_build_cmd, p.get_extension_build_env,
+                 p.get_extension_make_args, p.INSTALL_BASE)
+        p.SRC_DIR = src
+        p.INSTALL_BASE = src / "install"
+        p.run_build_cmd = lambda *a, **k: None
+        p.get_extension_build_env = lambda: {}
+        p.get_extension_make_args = lambda pg_config: ["make", "PG_CONFIG=x"]
+        try:
+            try:
+                p.build_contrib_extensions("18.6")
+                exited = None
+            except SystemExit as e:
+                exited = e.code
+            check("missing extension exits nonzero", exited, 1)
+
+            (contrib / p.CONTRIB_EXTENSIONS[0]).mkdir()
+            p.build_contrib_extensions("18.6")  # all present: no exit
+            check("complete tree builds", True, True)
+        finally:
+            (p.SRC_DIR, p.run_build_cmd, p.get_extension_build_env,
+             p.get_extension_make_args, p.INSTALL_BASE) = saved
+
+
+def test_extensions_install_into_the_version_built_not_the_symlink():
+    """The /usr/local/postgresql symlink can be left on an older version (the
+    user may decline the update). q3c must still install into the PostgreSQL it
+    is built for, from a clean tree."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for ver in ("18.4", "18.6"):
+            (base / f"postgresql-{ver}" / "bin").mkdir(parents=True)
+            (base / f"postgresql-{ver}" / "bin" / "pg_config").write_text("")
+        (base / "postgresql").symlink_to(base / "postgresql-18.4")
+        (base / "src" / "q3c-2.0.5").mkdir(parents=True)
+
+        calls = []
+        saved = (p.INSTALL_BASE, p.SRC_DIR, p.run_build_cmd,
+                 p.download_and_extract, p.get_extension_build_env)
+        p.INSTALL_BASE, p.SRC_DIR = base, base / "src"
+        p.run_build_cmd = lambda cmd, **k: calls.append(cmd) or True
+        p.download_and_extract = lambda url, dest, dry_run=False: dest / "q3c-2.0.5"
+        p.get_extension_build_env = lambda: {}
+        try:
+            p.build_q3c("2.0.5", "18.6")
+            want = f"PG_CONFIG={base}/postgresql-18.6/bin/pg_config"
+            check("every make call targets 18.6",
+                  all(want in c for c in calls), True)
+            check("cleaned before building", calls[0][-1], "clean")
+            check("clean, build, install", len(calls), 3)
+
+            try:
+                p.build_q3c("2.0.5", "18.9")
+                exited = None
+            except SystemExit as e:
+                exited = e.code
+            check("uninstalled target version exits nonzero", exited, 1)
+        finally:
+            (p.INSTALL_BASE, p.SRC_DIR, p.run_build_cmd,
+             p.download_and_extract, p.get_extension_build_env) = saved
+
+
 # ---------------------------------------------------------------------------
 
 def main():

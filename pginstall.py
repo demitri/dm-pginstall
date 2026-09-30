@@ -191,6 +191,29 @@ def get_fixed_pg_config_flags(pg_config: Path, flag_type: str) -> Optional[str]:
         return None
 
 
+def versioned_pg_config(pg_version: str, dry_run: bool = False) -> Path:
+    """pg_config of one specific installation, never the /usr/local/postgresql
+    symlink. The symlink may have been left on another version (the user can
+    decline the update), and extensions must land in the PostgreSQL they are
+    built against. Exits if that installation is absent (a dry run of a version
+    not yet built legitimately has none)."""
+    pg_config = INSTALL_BASE / f"postgresql-{pg_version}" / "bin" / "pg_config"
+    if not dry_run and not pg_config.is_file():
+        print(f"Error: PostgreSQL {pg_version} is not installed ({pg_config} missing).",
+              file=sys.stderr)
+        print(f"  Build it first: ./pginstall.py --component postgresql", file=sys.stderr)
+        sys.exit(1)
+    return pg_config
+
+
+def clean_extension_tree(make_args: list[str], src_path: Path, env: dict,
+                         verbose: bool = False) -> None:
+    """Remove build products left by an earlier run. make tracks file dates,
+    not which PG_CONFIG produced them, so a tree built against another
+    PostgreSQL would otherwise be reused as up to date."""
+    run_build_cmd(make_args + ["clean"], cwd=src_path, env=env, verbose=verbose)
+
+
 def get_extension_make_args(pg_config: Path) -> list[str]:
     """Get make arguments for building PostgreSQL extensions.
 
@@ -947,9 +970,10 @@ COMPONENT_VERSIONS = {
     "llvm": ["llvm"],
     "postgresql": ["postgresql"],
     "contrib": ["postgresql"],
-    "q3c": ["q3c"],
+    # q3c and pgast install into a specific PostgreSQL, not the symlink.
+    "q3c": ["q3c", "postgresql"],
     "ast": ["ast"],
-    "pgast": ["pgast"],
+    "pgast": ["pgast", "postgresql"],
 }
 
 
@@ -1993,7 +2017,7 @@ def build_contrib_extensions(
     print("Building contrib extensions")
     print(f"{'=' * 60}")
 
-    pg_config = INSTALL_BASE / "postgresql" / "bin" / "pg_config"
+    pg_config = versioned_pg_config(pg_version, dry_run)
     src_path = SRC_DIR / f"postgresql-{pg_version}" / "contrib"
 
     if dry_run:
@@ -2005,20 +2029,22 @@ def build_contrib_extensions(
     if not src_path.exists():
         print(f"  Error: PostgreSQL source not found at {src_path}", file=sys.stderr)
         print("  Contrib extensions must be built from PostgreSQL source", file=sys.stderr)
-        return
+        sys.exit(1)
 
     env = get_extension_build_env()
 
     for ext in CONTRIB_EXTENSIONS:
         ext_path = src_path / ext
         if not ext_path.exists():
-            print(f"  Warning: Extension {ext} not found at {ext_path}", file=sys.stderr)
-            continue
+            print(f"  Error: Extension {ext} not found at {ext_path}", file=sys.stderr)
+            sys.exit(1)
 
         print(f"  Building {ext}...")
 
-        # Build
         make_args = get_extension_make_args(pg_config)
+        clean_extension_tree(make_args, ext_path, env, verbose)
+
+        # Build
         run_build_cmd(
             make_args,
             cwd=ext_path,
@@ -2041,13 +2067,13 @@ def build_contrib_extensions(
         print(f"    {ext} installed successfully")
 
 
-def build_q3c(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_q3c(version: str, pg_version: str, dry_run: bool = False, verbose: bool = False) -> None:
     """Build q3c extension from GitHub."""
     print(f"\n{'=' * 60}")
     print(f"Building q3c {version}")
     print(f"{'=' * 60}")
 
-    pg_config = INSTALL_BASE / "postgresql" / "bin" / "pg_config"
+    pg_config = versioned_pg_config(pg_version, dry_run)
 
     # Download and extract
     url = f"https://github.com/segasai/q3c/archive/refs/tags/v{version}.tar.gz"
@@ -2060,6 +2086,7 @@ def build_q3c(version: str, dry_run: bool = False, verbose: bool = False) -> Non
 
     env = get_extension_build_env()
     make_args = get_extension_make_args(pg_config)
+    clean_extension_tree(make_args, src_path, env, verbose)
 
     # Build
     run_build_cmd(
@@ -2163,13 +2190,13 @@ def build_ast(version: str, dry_run: bool = False, verbose: bool = False, no_ali
     print(f"  AST {version} installed successfully")
 
 
-def build_pgast(version: str, dry_run: bool = False, verbose: bool = False) -> None:
+def build_pgast(version: str, pg_version: str, dry_run: bool = False, verbose: bool = False) -> None:
     """Build pgast extension from GitHub. Requires Starlink AST library."""
     print(f"\n{'=' * 60}")
     print(f"Building pgast {version}")
     print(f"{'=' * 60}")
 
-    pg_config = INSTALL_BASE / "postgresql" / "bin" / "pg_config"
+    pg_config = versioned_pg_config(pg_version, dry_run)
     ast_path = INSTALL_BASE / "ast"
     repo_path = SRC_DIR / "pgast"
 
@@ -2213,6 +2240,7 @@ def build_pgast(version: str, dry_run: bool = False, verbose: bool = False) -> N
     env = get_extension_build_env()
     make_args = get_extension_make_args(pg_config)
     make_args.append(f"AST={ast_path}")
+    clean_extension_tree(make_args, src_path, env, verbose)
 
     # Build (pass AST path to make)
     run_build_cmd(
@@ -2916,7 +2944,7 @@ def main() -> None:
         elif args.component == "contrib":
             build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
         elif args.component == "q3c":
-            build_q3c(versions["q3c"], args.dry_run, args.verbose)
+            build_q3c(versions["q3c"], versions["postgresql"], args.dry_run, args.verbose)
         elif args.component == "ast":
             if args.exclude_ast:
                 print("AST is excluded (--exclude-ast)")
@@ -2926,7 +2954,7 @@ def main() -> None:
             if args.exclude_ast:
                 print("pgast is excluded (--exclude-ast)")
             else:
-                build_pgast(versions["pgast"], args.dry_run, args.verbose)
+                build_pgast(versions["pgast"], versions["postgresql"], args.dry_run, args.verbose)
     else:
         # Build everything in order
         if plat == "darwin":
@@ -2941,10 +2969,10 @@ def main() -> None:
         build_contrib_extensions(versions["postgresql"], args.dry_run, args.verbose)
 
         if not args.skip_extensions:
-            build_q3c(versions["q3c"], args.dry_run, args.verbose)
+            build_q3c(versions["q3c"], versions["postgresql"], args.dry_run, args.verbose)
             if not args.exclude_ast:
                 build_ast(versions["ast"], args.dry_run, args.verbose, no_alias=na)
-                build_pgast(versions["pgast"], args.dry_run, args.verbose)
+                build_pgast(versions["pgast"], versions["postgresql"], args.dry_run, args.verbose)
 
     print(f"\n{'=' * 60}")
     print("Installation complete!")
