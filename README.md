@@ -14,7 +14,7 @@ A Python-based installer that automates building PostgreSQL and its dependencies
 
 ```bash
 # Install prerequisites (Debian/Ubuntu)
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git pkg-config
 
 # Create source directory (one-time setup)
 sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
@@ -42,6 +42,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 
 | Extension | Description | Source |
 |-----------|-------------|--------|
+| btree_gist | GiST index support for scalar types | PostgreSQL contrib |
 | citext | Case-insensitive text type | PostgreSQL contrib |
 | cube | Multi-dimensional cube data type | PostgreSQL contrib |
 | earthdistance | Great circle distance calculations | PostgreSQL contrib |
@@ -58,7 +59,7 @@ sudo mkdir -p /usr/local/src && sudo chown $(whoami) /usr/local/src
 ### Linux (Debian/Ubuntu)
 
 ```bash
-sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git gfortran
+sudo apt install build-essential bison flex libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev patchelf git pkg-config gfortran
 ```
 
 For JIT support (optional but recommended):
@@ -80,7 +81,7 @@ sudo apt install cmake ninja-build g++
 ### Linux (Fedora/RHEL)
 
 ```bash
-sudo dnf install gcc make bison flex readline-devel zlib-devel openssl-devel lz4-devel libzstd-devel patchelf git gcc-gfortran
+sudo dnf install gcc make bison flex readline-devel zlib-devel openssl-devel lz4-devel libzstd-devel patchelf git pkgconf-pkg-config gcc-gfortran
 ```
 
 For JIT support:
@@ -673,6 +674,7 @@ Components are built in dependency order:
    └── Enables JIT if LLVM is detected
 
 5. Contrib Extensions (from PostgreSQL source)
+   ├── btree_gist
    ├── citext
    ├── cube
    ├── earthdistance
@@ -771,6 +773,7 @@ otool -L /usr/local/postgresql/bin/postgres | grep icu
 psql -d postgres
 
 -- Test contrib extensions
+CREATE EXTENSION btree_gist;
 CREATE EXTENSION citext;
 CREATE EXTENSION cube;
 CREATE EXTENSION earthdistance;

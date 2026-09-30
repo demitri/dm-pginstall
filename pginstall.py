@@ -45,7 +45,7 @@ GITHUB_API = "https://api.github.com"
 GFORTRAN_MACOS_RELEASES = "https://github.com/fxcoudert/gfortran-for-macOS/releases"
 
 # Contrib extensions to build
-CONTRIB_EXTENSIONS = ["citext", "cube", "earthdistance", "ltree", "pgcrypto", "pg_trgm"]
+CONTRIB_EXTENSIONS = ["btree_gist", "citext", "cube", "earthdistance", "ltree", "pgcrypto", "pg_trgm"]
 
 
 def get_platform() -> str:
@@ -2335,7 +2335,7 @@ Components:
   icu          ICU - International Components for Unicode
   llvm         LLVM + clang (only with --build-llvm)
   postgresql   PostgreSQL database server
-  contrib      Contrib extensions (citext, cube, earthdistance, ltree, pgcrypto, pg_trgm)
+  contrib      Contrib extensions (btree_gist, citext, cube, earthdistance, ltree, pgcrypto, pg_trgm)
   q3c          Q3C spatial indexing extension
   ast          Starlink AST library (required by pgast)
   pgast        pgast extension (requires ast)
@@ -2434,9 +2434,11 @@ def get_required_tools(exclude_ast: bool = False, build_llvm: bool = False,
     if build_llvm:
         tools.extend(["cmake", "ninja", "c++"])
 
+    # configure resolves readline/openssl (macOS) and lz4/zstd (Linux) through
+    # pkg-config, and fails outright without it.
+    tools.append("pkg-config")
     if plat == "darwin":
         tools.append("clang")
-        tools.append("pkg-config")
     else:
         tools.append("patchelf")
 
@@ -2561,6 +2563,7 @@ def get_package_names_for_tools(tools: list[str], pkg_mgr: str) -> list[str]:
         "bison": {"apt": "bison", "dnf": "bison", "yum": "bison", "pacman": "bison"},
         "flex": {"apt": "flex", "dnf": "flex", "yum": "flex", "pacman": "flex"},
         "patchelf": {"apt": "patchelf", "dnf": "patchelf", "yum": "patchelf", "pacman": "patchelf"},
+        "pkg-config": {"apt": "pkg-config", "dnf": "pkgconf-pkg-config", "yum": "pkgconf-pkg-config", "pacman": "pkgconf"},
         "clang": {"apt": "clang", "dnf": "clang", "yum": "clang", "pacman": "clang"},
         "gfortran": {"apt": "gfortran", "dnf": "gcc-gfortran", "yum": "gcc-gfortran", "pacman": "gcc-fortran"},
         "cmake": {"apt": "cmake", "dnf": "cmake", "yum": "cmake", "pacman": "cmake"},
