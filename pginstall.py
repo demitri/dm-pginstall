@@ -227,7 +227,7 @@ def get_extension_make_args(pg_config: Path) -> list[str]:
     On macOS, includes fixed CPPFLAGS and LDFLAGS if the SDK path in pg_config
     is stale (can happen after Xcode updates).
     """
-    args = ["make", f"PG_CONFIG={pg_config}"]
+    args = ["make", f"-j{get_cpu_count()}", f"PG_CONFIG={pg_config}"]
 
     # Fix CPPFLAGS (for compilation)
     fixed_cppflags = get_fixed_pg_config_flags(pg_config, "cppflags")
