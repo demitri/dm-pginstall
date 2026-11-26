@@ -301,9 +301,17 @@ def build_pgvector(
 
     env = get_sanitized_env()
 
+    # pgxs's Makefile.global hard-codes PG_SYSROOT to the SDK PostgreSQL was
+    # built against and passes it as -isysroot, which overrides SDKROOT. After
+    # an Xcode update that SDK is gone, so override it on the make command line.
+    make_args = [f"PG_CONFIG={pg_config}"]
+    sdk_path = find_macos_sdk()
+    if sdk_path:
+        make_args.append(f"PG_SYSROOT={sdk_path}")
+
     # Build
     run_build_cmd(
-        ["make", f"PG_CONFIG={pg_config}", f"-j{get_cpu_count()}"],
+        ["make", *make_args, f"-j{get_cpu_count()}"],
         cwd=src_path,
         env=env,
         dry_run=dry_run,
@@ -313,7 +321,7 @@ def build_pgvector(
 
     # Install
     run_build_cmd(
-        ["sudo", "make", "install", f"PG_CONFIG={pg_config}"],
+        ["sudo", "make", "install", *make_args],
         cwd=src_path,
         env=env,
         dry_run=dry_run,
