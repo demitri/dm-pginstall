@@ -920,10 +920,10 @@ clang: warning: no such sysroot directory: '/Applications/Xcode.app/.../MacOSX15
 ld: library 'z' not found
 ```
 
-This happens because PostgreSQL records the SDK path at compile time. The installer automatically detects and fixes stale SDK paths when building extensions. If you encounter this error with an existing PostgreSQL installation, you may need to rebuild PostgreSQL or manually set `SDKROOT`:
+This happens because PostgreSQL's `configure` records the version-specific SDK path as `PG_SYSROOT` in the installed `lib/pgxs/src/Makefile.global`, and pgxs passes it to every extension build as `-isysroot`. Once an Xcode update removes that SDK, the path points nowhere. The installers (including `install_pgvector.py`) override it with the current SDK when building extensions. Setting `SDKROOT` does not help, because an explicit `-isysroot` takes precedence over it. To build some other pgxs extension by hand against an existing installation, override the variable on the make command line, or rebuild PostgreSQL:
 
 ```bash
-export SDKROOT=$(xcrun --show-sdk-path)
+make PG_SYSROOT=$(xcrun --show-sdk-path)
 ```
 
 ## Version Detection
